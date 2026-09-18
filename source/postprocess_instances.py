@@ -74,17 +74,17 @@ from typing import Optional, Union
 
 from source.data_io import DataIO, Zarr2DataIO
 from source.instance_segmentation_pipeline import parse_cfg
-from source.metadata_handler import _COLUMNS  # same schema/column names as the main pipeline -- single source of truth
+from source.metadata_handler import \
+    _COLUMNS  # same schema/column names as the main pipeline -- single source of truth
 from source.utils import generate_chunks, mark_completed, \
     filter_remaining_chunks, mk_dir, resolve_path
-
 
 
 def get_slice(origin: np.ndarray, far_corner: np.ndarray) -> tuple:
     return tuple(slice(int(o), int(f)) for o, f in zip(origin, far_corner))
 
-
-def _new_zarr_like(source_io: DataIO, path: Union[str, Path], chunk_size: np.ndarray) -> Zarr2DataIO:
+def _new_zarr_like(source_io: DataIO, path: Union[str, Path],
+                   chunk_size: np.ndarray) -> Zarr2DataIO:
     """Create a fresh Zarr array with the same shape/dtype as the
     source, chunked the same way the pipeline chunks it. RescanSteps
     write here, never back into the source they're reading from."""
@@ -95,12 +95,13 @@ def _new_zarr_like(source_io: DataIO, path: Union[str, Path], chunk_size: np.nda
             f"destination. Delete it first if you intend to redo this step "
             f"from scratch, or point dest_path somewhere new."
         )
-    return Zarr2DataIO(path, chunk_size=tuple(int(c) for c in chunk_size), array_shape=source_io.shape)
+    return Zarr2DataIO(path, chunk_size=tuple(int(c) for c in chunk_size),
+                       array_shape=source_io.shape)
 
 
 @dataclass
-class PostprocessContext:
-    io_func: DataIO
+class PostprocessParams:
+    instance_vol: DataIO
     chunk_size: np.ndarray
     stack_dim: np.ndarray
     scratch_dir: Path
@@ -118,7 +119,7 @@ class RescanStep(ABC):
     name: str = "rescan_step"
 
     @abstractmethod
-    def apply_to_volume(self, ctx: PostprocessContext) -> DataIO:
+    def apply_to_volume(self, ctx: PostprocessParams) -> DataIO:
         """Read from ctx.source_io, write the result to a NEW
         destination (never back into ctx.source_io -- see module
         docstring), and return the DataIO for that destination. The
@@ -135,7 +136,8 @@ class TargetedStep(ABC):
     name: str = "targeted_step"
 
     @abstractmethod
-    def apply(self, ctx: PostprocessContext, metadata_df: pd.DataFrame) -> pd.DataFrame:
+    def apply(self, ctx: PostprocessParams,
+              metadata_df: pd.DataFrame) -> pd.DataFrame:
         """Apply the edit to ctx.source_io and return the updated
         metadata table (e.g. with removed objects' rows dropped)."""
 
@@ -147,32 +149,50 @@ class TargetedStep(ABC):
 class ExpandLabelsStep(RescanStep):
     name = "expand_labels"
 
-    def __init__(self, distance: int, dest_path: Union[str, Path], halo: Optional[int] = None):
+    def __init__(self, distance: int, dest_path: Union[str, Path],
+                 halo: Optional[int] = None):
         self.distance = distance
         self.dest_path = Path(dest_path)
         # Must be >= distance for correctness (see module docstring);
         # a little extra margin is cheap insurance, not required.
         self.halo = halo if halo is not None else distance
 
-    def apply_to_volume(self, ctx: PostprocessContext) -> DataIO:
-        progress_dir = mk_dir(ctx.scratch_dir / f"progress_postprocess_{self.name}")
-        dest_io = (
-            Zarr2DataIO(self.dest_path)
-            if self.dest_path.exists()
-            else _new_zarr_like(ctx.io_func, self.dest_path, ctx.chunk_size)
-        )
+    def apply_to_volume(self, ctx: PostprocessParams) -> DataIO:
+        progress_dir = mk_dir(
+            ctx.scratch_dir / f"progress_postprocess_{self.name}")
+        project_dir = ctx.scratch_dir.parent
+        self.dest_path = resolve_path(self.dest_path,
+                                      default_path=project_dir / f"instances_metadata_{self.name}.parquet",
+                                      base_dir=ctx.scratch_dir.parent)
+        # dest_io = (
+        #     Zarr2DataIO(self.dest_path)
+        #     if self.dest_path.exists()
+        #     else _new_zarr_like(ctx.instance_vol, self.dest_path,
+        #                         ctx.chunk_size)
+        # )
+        if self.dest_path.exists():
+            dest_io = Zarr2DataIO(
+                self.dest_path,
+                chunk_size=tuple(int(c) for c in ctx.chunk_size),
+            )
+        else:
+            dest_io = _new_zarr_like(ctx.instance_vol, self.dest_path,
+                                     ctx.chunk_size)
 
         chunks = generate_chunks(ctx.stack_dim, ctx.chunk_size)
         remaining = filter_remaining_chunks(chunks, progress_dir)
-        print(f"{self.name}: {len(chunks) - len(remaining)}/{len(chunks)} chunks already done")
+        print(
+            f"{self.name}: {len(chunks) - len(remaining)}/{len(chunks)} chunks already done")
         if remaining:
             Parallel(n_jobs=ctx.n_jobs, backend=ctx.parallel_backend)(
-                delayed(self._process_chunk)(chunk[0], chunk[1], ctx, dest_io, progress_dir)
+                delayed(self._process_chunk)(chunk[0], chunk[1], ctx, dest_io,
+                                             progress_dir)
                 for chunk in tqdm(remaining, desc=f"{self.name} (haloed)")
             )
         return dest_io
 
-    def _process_chunk(self, origin, far_corner, ctx: PostprocessContext, dest_io: DataIO, progress_dir: Path):
+    def _process_chunk(self, origin, far_corner, ctx: PostprocessParams,
+                       dest_io: DataIO, progress_dir: Path):
         halo = np.full(3, self.halo, dtype=np.int64)
         padded_origin = np.maximum(origin - halo, ctx.stack_dim[0])
         padded_far = np.minimum(far_corner + halo, ctx.stack_dim[1])
@@ -180,22 +200,25 @@ class ExpandLabelsStep(RescanStep):
         # Read from the IMMUTABLE source -- never dest_io -- so this
         # chunk's neighbors can't have been mutated yet no matter what
         # order workers finish in.
-        padded = ctx.io_func.get_data(get_slice(padded_origin, padded_far))
+        padded = ctx.instance_vol.get_data(get_slice(padded_origin, padded_far))
         expanded = expand_labels(padded, distance=self.distance)
 
         core_start = origin - padded_origin
         core_end = core_start + (far_corner - origin)
-        core = expanded[core_start[0]:core_end[0], core_start[1]:core_end[1], core_start[2]:core_end[2]]
+        core = expanded[core_start[0]:core_end[0], core_start[1]:core_end[1],
+               core_start[2]:core_end[2]]
         dest_io.write_data(core, get_slice(origin, far_corner))
 
-        mark_completed(chunk_coords=np.array([origin, far_corner]), progress_dir=progress_dir)
+        mark_completed(chunk_coords=np.array([origin, far_corner]),
+                       progress_dir=progress_dir)
 
 
 # ----------------------------------------------------------------------
 # TargetedStep: remove objects outside a voxel-count range
 # ----------------------------------------------------------------------
 
-def _chunks_overlapping_bbox(bbox, chunk_size: np.ndarray, stack_dim: np.ndarray) -> list:
+def _chunks_overlapping_bbox(bbox, chunk_size: np.ndarray,
+                             stack_dim: np.ndarray) -> list:
     """Every pipeline-chunk origin whose region intersects this bbox --
     a bbox from a merged object can legitimately span several chunks."""
     lo = np.array(bbox[:3])
@@ -212,16 +235,22 @@ def _chunks_overlapping_bbox(bbox, chunk_size: np.ndarray, stack_dim: np.ndarray
     return origins
 
 
-class SizeFilterStep(TargetedStep):
+class SizeFilterStep(
+    TargetedStep):
     name = "size_filter"
 
-    def __init__(self, min_nvoxels: Optional[int] = None, max_nvoxels: Optional[int] = None):
+    def __init__(self, dest_path: Optional[Union[str, Path]] = None,
+                 min_nvoxels: Optional[int] = None,
+                 max_nvoxels: Optional[int] = None):
+        self.dest_path = dest_path
         if min_nvoxels is None and max_nvoxels is None:
-            raise ValueError("SizeFilterStep needs at least one of min_nvoxels/max_nvoxels")
+            raise ValueError(
+                "SizeFilterStep needs at least one of min_nvoxels/max_nvoxels")
         self.min_nvoxels = min_nvoxels
         self.max_nvoxels = max_nvoxels
 
-    def apply(self, ctx: PostprocessContext, metadata_df: pd.DataFrame) -> pd.DataFrame:
+    def apply(self, ctx: PostprocessParams,
+              metadata_df: pd.DataFrame) -> pd.DataFrame:
         keep = pd.Series(True, index=metadata_df.index)
         if self.min_nvoxels is not None:
             keep &= metadata_df["nvoxels"] >= self.min_nvoxels
@@ -229,37 +258,56 @@ class SizeFilterStep(TargetedStep):
             keep &= metadata_df["nvoxels"] <= self.max_nvoxels
 
         to_remove = metadata_df.loc[~keep]
-        print(f"{self.name}: removing {len(to_remove)}/{len(metadata_df)} objects")
+        print(
+            f"{self.name}: removing {len(to_remove)}/{len(metadata_df)} objects")
         if len(to_remove):
-            self._remove_from_volume(ctx, to_remove)
+            self._remove_from_volume(ctx, to_remove, self.dest_path)
         return metadata_df.loc[keep].reset_index(drop=True)
 
     @staticmethod
-    def _remove_from_volume(ctx: PostprocessContext, rows: pd.DataFrame):
+    def _remove_from_volume(ctx: PostprocessParams, rows: pd.DataFrame,
+                            dest_path):
         # Group removed ids by every physical chunk their bbox touches,
         # so each chunk region is only ever written by one worker --
         # the same "one writer per region" rule Pass 3 uses, needed
         # here because two removed objects' bboxes can overlap the same
         # chunk.
+        output_volume_name = resolve_path(dest_path,
+                                          default_path=ctx.instance_vol.zarr_path,
+                                          base_dir=ctx.scratch_dir.parent)
+        # output_volume = (Zarr2DataIO(
+        #     output_volume_name) if output_volume_name.exists() else _new_zarr_like(
+        #     ctx.instance_vol, dest_path, ctx.chunk_size))
+        if output_volume_name.exists():
+            output_volume = Zarr2DataIO(
+                output_volume_name,
+                chunk_size=tuple(int(c) for c in ctx.chunk_size),
+            )
+        else:
+            output_volume = _new_zarr_like(ctx.instance_vol, output_volume_name,
+                                     ctx.chunk_size)
+
         chunk_to_ids = defaultdict(list)
         for _, row in rows.iterrows():
             bbox = (row.bbox_z_min, row.bbox_y_min, row.bbox_x_min,
                     row.bbox_z_max, row.bbox_y_max, row.bbox_x_max)
-            for origin in _chunks_overlapping_bbox(bbox, ctx.chunk_size, ctx.stack_dim):
+            for origin in _chunks_overlapping_bbox(bbox, ctx.chunk_size,
+                                                   ctx.stack_dim):
                 chunk_to_ids[tuple(origin.tolist())].append(int(row.object_id))
 
         def _process(origin_key, ids):
             origin = np.array(origin_key)
             far_corner = np.minimum(origin + ctx.chunk_size, ctx.stack_dim[1])
             sl = get_slice(origin, far_corner)
-            data = ctx.io_func.get_data(sl)
+            data = ctx.instance_vol.get_data(sl)
             mask = np.isin(data, ids)
             if np.any(mask):
                 data[mask] = 0
-                ctx.io_func.write_data(data, sl)
+                output_volume.write_data(data, sl)
 
         Parallel(n_jobs=ctx.n_jobs, backend=ctx.parallel_backend)(
-            delayed(_process)(k, v) for k, v in tqdm(chunk_to_ids.items(), desc=f"{SizeFilterStep.name}: removing")
+            delayed(_process)(k, v) for k, v in
+            tqdm(chunk_to_ids.items(), desc=f"{SizeFilterStep.name}: removing")
         )
 
 
@@ -272,8 +320,9 @@ def _rescan_chunk(origin, far_corner, source_io: DataIO) -> pd.DataFrame:
     data = source_io.get_data(get_slice(origin, far_corner))
     nz = np.nonzero(data)
     if len(nz[0]) == 0:
-        return pd.DataFrame(columns=["object_id", "bbox_z_min", "bbox_y_min", "bbox_x_min",
-                                      "bbox_z_max", "bbox_y_max", "bbox_x_max", "nvoxels"])
+        return pd.DataFrame(
+            columns=["object_id", "bbox_z_min", "bbox_y_min", "bbox_x_min",
+                     "bbox_z_max", "bbox_y_max", "bbox_x_max", "nvoxels"])
     ids_flat = np.asarray(data[nz]).astype(np.int64)
     # Vectorized groupby instead of a per-id np.where loop (what Pass 1
     # itself still does) -- much faster when a chunk holds many objects,
@@ -284,14 +333,16 @@ def _rescan_chunk(origin, far_corner, source_io: DataIO) -> pd.DataFrame:
         "z": nz[0] + origin[0], "y": nz[1] + origin[1], "x": nz[2] + origin[2],
     })
     agg = coords.groupby("object_id").agg(
-        bbox_z_min=("z", "min"), bbox_y_min=("y", "min"), bbox_x_min=("x", "min"),
-        bbox_z_max=("z", "max"), bbox_y_max=("y", "max"), bbox_x_max=("x", "max"),
+        bbox_z_min=("z", "min"), bbox_y_min=("y", "min"),
+        bbox_x_min=("x", "min"),
+        bbox_z_max=("z", "max"), bbox_y_max=("y", "max"),
+        bbox_x_max=("x", "max"),
         nvoxels=("z", "size"),
     ).reset_index()
     return agg
 
 
-def rescan_metadata(ctx: PostprocessContext) -> pd.DataFrame:
+def rescan_metadata(ctx: PostprocessParams) -> pd.DataFrame:
     """Ground-truth metadata recompute, scanning the current volume
     directly -- the only correct way to know an object's extent after
     an operation (like expand_labels) that can grow it into chunks it
@@ -303,17 +354,21 @@ def rescan_metadata(ctx: PostprocessContext) -> pd.DataFrame:
     start = time.time()
     chunks = generate_chunks(ctx.stack_dim, ctx.chunk_size)
     partials = Parallel(n_jobs=ctx.n_jobs, backend=ctx.parallel_backend)(
-        delayed(_rescan_chunk)(chunk[0], chunk[1], ctx.io_func)
+        delayed(_rescan_chunk)(chunk[0], chunk[1], ctx.instance_vol)
         for chunk in tqdm(chunks, desc="rescanning metadata")
     )
     partials = [p for p in partials if len(p)]
     if not partials:
-        result = pd.DataFrame(columns=["object_id", "chunk_id", *[c for c in _COLUMNS if c not in ("object_id", "chunk_id")]])
+        result = pd.DataFrame(columns=["object_id", "chunk_id",
+                                       *[c for c in _COLUMNS if
+                                         c not in ("object_id", "chunk_id")]])
     else:
         full = pd.concat(partials, ignore_index=True)
         result = full.groupby("object_id").agg(
-            bbox_z_min=("bbox_z_min", "min"), bbox_y_min=("bbox_y_min", "min"), bbox_x_min=("bbox_x_min", "min"),
-            bbox_z_max=("bbox_z_max", "max"), bbox_y_max=("bbox_y_max", "max"), bbox_x_max=("bbox_x_max", "max"),
+            bbox_z_min=("bbox_z_min", "min"), bbox_y_min=("bbox_y_min", "min"),
+            bbox_x_min=("bbox_x_min", "min"),
+            bbox_z_max=("bbox_z_max", "max"), bbox_y_max=("bbox_y_max", "max"),
+            bbox_x_max=("bbox_x_max", "max"),
             nvoxels=("nvoxels", "sum"),
         ).reset_index()
         # chunk_id isn't meaningful post-rescan for objects spanning
@@ -322,15 +377,22 @@ def rescan_metadata(ctx: PostprocessContext) -> pd.DataFrame:
         # arbitrary one that looks more authoritative than it is.
         result["chunk_id"] = ""
     if ctx.verbose:
-        print(f"rescan_metadata: {len(result)} objects in {time.time() - start:.1f}s", flush=True)
+        print(
+            f"rescan_metadata: {len(result)} objects in {time.time() - start:.1f}s",
+            flush=True)
     return result[_COLUMNS]
 
-# todo> check whether metafile gets iverwritten, if volume dies not neither should the metafile
+
+# todo: each outputvolume needs a dedicated instance object metafile. If the input volume does not get overwritten by the postporcessing a dedicated metadata file needs to be written
+# todo: require output_metapath to be set if a new volume dest_path is given in the config
+
 # ----------------------------------------------------------------------
 # Runner
 # ----------------------------------------------------------------------
 
-def run_postprocessing(steps: list, ctx: PostprocessContext, metadata_path: Union[str, Path], output_metadata_path:Optional[str]=None) -> tuple:
+def run_postprocessing(steps: list, ctx: PostprocessParams,
+                       metadata_path: Union[str, Path],
+                       output_metadata_path: Optional[str] = None) -> tuple:
     """Run steps in order. Metadata is only rescanned when a RescanStep
     has actually run since the last accurate metadata was available --
     consecutive RescanSteps share a single rescan afterward rather than
@@ -339,18 +401,20 @@ def run_postprocessing(steps: list, ctx: PostprocessContext, metadata_path: Unio
     dirty = False
 
     for step in steps:
-        if isinstance(step, RescanStep):
+        if isinstance(step, TargetedStep) and dirty:
+            metadata_df = rescan_metadata(ctx)
+            dirty = False
+        elif isinstance(step, RescanStep):
             print(f"--- {step.name} (volume) ---")
-            ctx.io_func = step.apply_to_volume(ctx)
+            ctx.instance_vol = step.apply_to_volume(ctx)
             dirty = True
         elif isinstance(step, TargetedStep):
-            if dirty:
-                metadata_df = rescan_metadata(ctx)
-                dirty = False
             print(f"--- {step.name} (metadata-targeted) ---")
             metadata_df = step.apply(ctx, metadata_df)
         else:
-            raise TypeError(f"step {step!r} is neither a RescanStep nor a TargetedStep")
+            raise TypeError(
+                f"step {step!r} is neither a RescanStep nor a TargetedStep")
+
 
     if dirty:
         metadata_df = rescan_metadata(ctx)
@@ -360,7 +424,7 @@ def run_postprocessing(steps: list, ctx: PostprocessContext, metadata_path: Unio
     metadata_df.to_parquet(tmp, index=False)
     tmp.replace(metadata_path)
 
-    return ctx.io_func, metadata_df
+    return ctx.instance_vol, metadata_df
 
 
 # ----------------------------------------------------------------------
@@ -402,29 +466,47 @@ def parse_postprocess_cfg(pp_cfg: dict) -> tuple:
         run_cfg = yaml.safe_load(f)
 
     # Use the pipeline's exact logic to resolve paths, defaults, and data IO
-    pipeline_params = parse_cfg(run_cfg)
+    instance_params = parse_cfg(run_cfg)
     project_dir = Path(run_cfg["project_dir"])
+
+    stack_dim = instance_params.stack_dim
+    if stack_dim is None:
+        stack_dim = np.array([[0, 0, 0], instance_params.output_data.shape],
+                             dtype=np.int64)
 
     # 2. Build context strictly from the pipeline's validated parameters
     # The pipeline's output_data (instance_vol) automatically becomes the post-processor's source io_func.
-    context = PostprocessContext(
-        io_func=pipeline_params.output_data,
-        chunk_size=pipeline_params.chunk_size,
-        stack_dim=pipeline_params.stack_dim,
-        scratch_dir= pp_cfg["scratch_dir"],
-        parallel_backend=pipeline_params.parallel_backend,
+    context = PostprocessParams(
+        instance_vol=instance_params.output_data,
+        chunk_size=instance_params.chunk_size,
+        stack_dim=stack_dim,
+        scratch_dir=instance_params.scratch_dir,
+        parallel_backend=instance_params.parallel_backend,
         n_jobs=pp_cfg.get("n_jobs", run_cfg.get("n_jobs", -1)),
-        verbose=pipeline_params.verbose
+        verbose=instance_params.verbose
     )
 
     # 3. Resolve post-processing specific variables
-    metadata_path = pipeline_params.metadata_path
-
+    metadata_path = instance_params.metadata_path
     out_meta = pp_cfg.get("output_metadata_path")
-    output_metadata_path = resolve_path(out_meta, default_path=metadata_path,
-                                        base_dir=project_dir) if out_meta else None
+    # output_metadata_path = resolve_path(out_meta, default_path=metadata_path,
+    #                                     base_dir=project_dir) if out_meta else None
 
     steps = pp_cfg.get("steps", [])
+    dest_paths = [step.get("dest_path") for step in steps if
+                  step.get("dest_path")]
+    last_dest_path = dest_paths[-1] if dest_paths else None
+
+    if out_meta:
+        meta_root = Path(last_dest_path).parent if last_dest_path else project_dir # will
+        # Derived automatically from the volume destination filename
+        default_meta_name = Path(last_dest_path).stem + "_metadata.parquet"
+        output_metadata_path = resolve_path(out_meta,
+                                            default_path= meta_root / default_meta_name,
+                                            base_dir=project_dir)
+    else:
+        # No new volume destination; fallback to updating original metadata
+        output_metadata_path = metadata_path
 
     return context, metadata_path, output_metadata_path, steps
 
@@ -451,29 +533,3 @@ if __name__ == "__main__":
 
     print(f"Postprocessing completed! {len(final_metadata)} objects remain. "
           f"Final volume: {final_io.zarr_path if hasattr(final_io, 'zarr_path') else final_io}")
-
-if __name__ == "__main__":
-    parser = ArgumentParser()
-    parser.add_argument("--config", help="")
-    args = parser.parse_args()
-    with open(args.config, 'r') as f:
-        cfg = yaml.safe_load(f)
-
-    source_io = Zarr2DataIO(cfg["source_instance_vol"])
-    context = PostprocessContext(
-        io_func=source_io,
-        chunk_size=np.array(cfg["chunk_size"]),
-        stack_dim=np.array(cfg.get("stack_dim", [[0, 0, 0], source_io.shape])),
-        scratch_dir=mk_dir(cfg["scratch_dir"]),
-        parallel_backend=cfg.get("parallel_backend", "loky"),
-        n_jobs=cfg.get("n_jobs", -1),
-        verbose=cfg.get("verbose", False),
-    )
-    postprocess_steps = build_steps(cfg["steps"])
-
-    final_io, final_metadata = run_postprocessing(
-        postprocess_steps, context, cfg["metadata_path"],
-        cfg.get("output_metadata_path",None),
-    )
-    print(f"Postprocessing completed! {len(final_metadata)} objects remain. "
-          f"Final volume: {final_io.zarr_path if isinstance(final_io, Zarr2DataIO) else final_io}")

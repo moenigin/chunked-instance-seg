@@ -1,0 +1,27 @@
+# ==========================================
+# INSTANCE SEGMENTATION PIPELINE CONFIG
+# ==========================================
+
+# Core Project Directories
+project_dir: "/path/to/my_project"
+scratch_dir: "scratch"                  # Resolves relative to project_dir if not absolute
+
+# IO Configuration
+io_func: "zarr2"                        # Data format handler to use
+semantic_vol: "/path/to/semantic.zarr"  # Input semantic segmentation volume
+instance_vol: "instance_vol.zarr"       # Output instance volume (resolves relative to project_dir)
+metadata_path: "metadata.parquet"       # Consolidated metadata output (resolves relative to project_dir)
+
+# Volume & Chunk Dimensions
+volume_size: [1000, 1000, 1000]         # Total shape of the output array [Z, Y, X]
+chunk_size: [100, 100, 100]             # Processing chunk size [Z, Y, X]
+# stack_dim: [[0, 0, 0], [500, 500, 500]] # Optional: Crop region to process (defaults to full volume)
+
+# Algorithm Parameters
+target_label: 1                         # The pixel value in semantic_vol to segment
+min_object_size: 300                    # Initial minimum voxel count for an object (Pass 1)
+
+# Execution Constraints
+parallel_backend: "loky"                # 'loky' (multiprocessing) or 'threading'
+n_jobs: -1                              # Number of parallel workers (-1 for all available cores)
+verbose: false

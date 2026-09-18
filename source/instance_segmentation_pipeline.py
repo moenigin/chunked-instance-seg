@@ -666,8 +666,10 @@ def parse_cfg(cfg_params):
     if output_volume.parent == Path("."):
         output_volume = project_dir.joinpath(output_volume)
 
+    instance_vol_path = Path(cfg_params["instance_vol"])
+    default_meta_name = f"{instance_vol_path.stem}_metadata.parquet"
     cfg_params["metadata_path"] = resolve_path(cfg_params.get("metadata_path"),
-                                               default_path=project_dir / "instance_metadata.parquet",
+                                               default_path=project_dir / default_meta_name,
                                                base_dir=project_dir)
 
     cfg_params["scratch_dir"] = resolve_path(cfg_params.get("scratch_dir"),
