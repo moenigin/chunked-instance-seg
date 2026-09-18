@@ -59,6 +59,7 @@ Two things have to both be true for chunked processing here to be safe:
 """
 import numpy as np
 import pandas as pd
+import shutil
 import time
 import yaml
 
@@ -80,8 +81,25 @@ from source.utils import generate_chunks, mark_completed, \
     filter_remaining_chunks, mk_dir, resolve_path
 
 
+class OutputVolumeNotWritten(RuntimeError):
+    """Raised when the pipeline finishes but no volume exists at
+    ctx.output_vol_path -- e.g. every step turned out to be a no-op
+    (a SizeFilterStep with nothing to remove and no step after it).
+    actual_path is where the data really is, so a caller can redirect
+    a downstream step there instead of treating this as pure failure."""
+
+    def __init__(self, expected_path: Path, actual_path: Path):
+        self.expected_path = Path(expected_path)
+        self.actual_path = Path(actual_path)
+        super().__init__(
+            f"no volume written to {self.expected_path} -- every step was a "
+            f"no-op; data is unchanged at {self.actual_path}"
+        )
+
+
 def get_slice(origin: np.ndarray, far_corner: np.ndarray) -> tuple:
     return tuple(slice(int(o), int(f)) for o, f in zip(origin, far_corner))
+
 
 def _new_zarr_like(source_io: DataIO, path: Union[str, Path],
                    chunk_size: np.ndarray) -> Zarr2DataIO:
@@ -105,9 +123,14 @@ class PostprocessParams:
     chunk_size: np.ndarray
     stack_dim: np.ndarray
     scratch_dir: Path
+    output_vol_path: Optional[
+        Path] = None  # single destination for the whole run
+    allow_overwrite: bool = False  # mutate the original input in place
     parallel_backend: str = 'loky'
     n_jobs: int = -1
     verbose: bool = False
+    cleanup_scratch: bool = True  # remove intermediate step stores + progress dirs on success
+    require_output_at_path: bool = True  # raise OutputVolumeNotWritten if output_vol_path was never created
 
 
 class RescanStep(ABC):
@@ -134,6 +157,8 @@ class TargetedStep(ABC):
     since it never depends on a neighbor's un-mutated state."""
 
     name: str = "targeted_step"
+    dest_path: Optional[Path] = None
+    wrote_volume: bool = False  # apply() sets this; tells the runner whether ctx.instance_vol should move
 
     @abstractmethod
     def apply(self, ctx: PostprocessParams,
@@ -145,14 +170,14 @@ class TargetedStep(ABC):
 # ----------------------------------------------------------------------
 # RescanStep: expand_labels on haloed, non-overlapping-write chunks
 # ----------------------------------------------------------------------
-
 class ExpandLabelsStep(RescanStep):
     name = "expand_labels"
 
-    def __init__(self, distance: int, dest_path: Union[str, Path],
-                 halo: Optional[int] = None):
+    def __init__(self, distance: int, halo: Optional[int] = None,
+                 dest_path: Optional[Union[str, Path]] = None):
         self.distance = distance
-        self.dest_path = Path(dest_path)
+        self.halo = halo if halo is not None else distance
+        self.dest_path = Path(dest_path) if dest_path is not None else None
         # Must be >= distance for correctness (see module docstring);
         # a little extra margin is cheap insurance, not required.
         self.halo = halo if halo is not None else distance
@@ -164,12 +189,7 @@ class ExpandLabelsStep(RescanStep):
         self.dest_path = resolve_path(self.dest_path,
                                       default_path=project_dir / f"instances_metadata_{self.name}.parquet",
                                       base_dir=ctx.scratch_dir.parent)
-        # dest_io = (
-        #     Zarr2DataIO(self.dest_path)
-        #     if self.dest_path.exists()
-        #     else _new_zarr_like(ctx.instance_vol, self.dest_path,
-        #                         ctx.chunk_size)
-        # )
+
         if self.dest_path.exists():
             dest_io = Zarr2DataIO(
                 self.dest_path,
@@ -216,7 +236,6 @@ class ExpandLabelsStep(RescanStep):
 # ----------------------------------------------------------------------
 # TargetedStep: remove objects outside a voxel-count range
 # ----------------------------------------------------------------------
-
 def _chunks_overlapping_bbox(bbox, chunk_size: np.ndarray,
                              stack_dim: np.ndarray) -> list:
     """Every pipeline-chunk origin whose region intersects this bbox --
@@ -235,8 +254,7 @@ def _chunks_overlapping_bbox(bbox, chunk_size: np.ndarray,
     return origins
 
 
-class SizeFilterStep(
-    TargetedStep):
+class SizeFilterStep(TargetedStep):
     name = "size_filter"
 
     def __init__(self, dest_path: Optional[Union[str, Path]] = None,
@@ -260,32 +278,36 @@ class SizeFilterStep(
         to_remove = metadata_df.loc[~keep]
         print(
             f"{self.name}: removing {len(to_remove)}/{len(metadata_df)} objects")
-        if len(to_remove):
-            self._remove_from_volume(ctx, to_remove, self.dest_path)
+
+        dest = Path(self.dest_path)
+        in_place = dest == Path(ctx.instance_vol.zarr_path)
+
+        if len(to_remove) == 0:
+            if in_place:
+                print(
+                    f"{self.name}: nothing to remove -- volume already correct, no write needed")
+            else:
+                print(
+                    f"{self.name}: nothing to remove -- skipping copy; volume stays at "
+                    f"{ctx.instance_vol.zarr_path} instead of {dest}")
+            self.wrote_volume = False
+            return metadata_df.loc[keep].reset_index(drop=True)
+
+        self._remove_from_volume(ctx, to_remove, dest)
+        self.wrote_volume = True
         return metadata_df.loc[keep].reset_index(drop=True)
 
     @staticmethod
     def _remove_from_volume(ctx: PostprocessParams, rows: pd.DataFrame,
-                            dest_path):
-        # Group removed ids by every physical chunk their bbox touches,
-        # so each chunk region is only ever written by one worker --
-        # the same "one writer per region" rule Pass 3 uses, needed
-        # here because two removed objects' bboxes can overlap the same
-        # chunk.
-        output_volume_name = resolve_path(dest_path,
-                                          default_path=ctx.instance_vol.zarr_path,
-                                          base_dir=ctx.scratch_dir.parent)
-        # output_volume = (Zarr2DataIO(
-        #     output_volume_name) if output_volume_name.exists() else _new_zarr_like(
-        #     ctx.instance_vol, dest_path, ctx.chunk_size))
-        if output_volume_name.exists():
+                            dest_path: Path):
+        in_place = dest_path == Path(ctx.instance_vol.zarr_path)
+
+        if dest_path.exists():
             output_volume = Zarr2DataIO(
-                output_volume_name,
-                chunk_size=tuple(int(c) for c in ctx.chunk_size),
-            )
+                dest_path, chunk_size=tuple(int(c) for c in ctx.chunk_size))
         else:
-            output_volume = _new_zarr_like(ctx.instance_vol, output_volume_name,
-                                     ctx.chunk_size)
+            output_volume = _new_zarr_like(ctx.instance_vol, dest_path,
+                                           ctx.chunk_size)
 
         chunk_to_ids = defaultdict(list)
         for _, row in rows.iterrows():
@@ -295,27 +317,44 @@ class SizeFilterStep(
                                                    ctx.stack_dim):
                 chunk_to_ids[tuple(origin.tolist())].append(int(row.object_id))
 
-        def _process(origin_key, ids):
-            origin = np.array(origin_key)
-            far_corner = np.minimum(origin + ctx.chunk_size, ctx.stack_dim[1])
-            sl = get_slice(origin, far_corner)
-            data = ctx.instance_vol.get_data(sl)
-            mask = np.isin(data, ids)
-            if np.any(mask):
-                data[mask] = 0
-                output_volume.write_data(data, sl)
+        # Progress dir keyed on dest_path's own name -- each step
+        # instance already writes to a distinct location (per the
+        # runner's dest resolution), so this can't collide between
+        # two SizeFilterStep instances in the same pipeline run.
+        progress_dir = mk_dir(
+            ctx.scratch_dir / f"progress_postprocess_{SizeFilterStep.name}_{dest_path.stem}")
+        all_chunks = generate_chunks(ctx.stack_dim, ctx.chunk_size)
+        remaining = filter_remaining_chunks(all_chunks, progress_dir)
+        print(
+            f"{SizeFilterStep.name}: {len(all_chunks) - len(remaining)}/{len(all_chunks)} chunks already done")
 
-        Parallel(n_jobs=ctx.n_jobs, backend=ctx.parallel_backend)(
-            delayed(_process)(k, v) for k, v in
-            tqdm(chunk_to_ids.items(), desc=f"{SizeFilterStep.name}: removing")
-        )
+        def _process(origin, far_corner):
+            ids = chunk_to_ids.get(tuple(origin.tolist()), [])
+            sl = get_slice(origin, far_corner)
+            if ids:
+                data = ctx.instance_vol.get_data(sl)
+                mask = np.isin(data, ids)
+                if np.any(mask):
+                    data[mask] = 0
+                if not in_place or np.any(mask):
+                    output_volume.write_data(data, sl)
+            elif not in_place:
+                output_volume.write_data(ctx.instance_vol.get_data(sl), sl)
+            mark_completed(chunk_coords=np.array([origin, far_corner]),
+                           progress_dir=progress_dir)
+
+        if remaining:
+            Parallel(n_jobs=ctx.n_jobs, backend=ctx.parallel_backend)(
+                delayed(_process)(o, f) for o, f in
+                tqdm(remaining, desc=f"{SizeFilterStep.name}: writing chunks"))
+        else:
+            print(f"{SizeFilterStep.name}: all chunks already written")
 
 
 # ----------------------------------------------------------------------
 # Full metadata rescan -- ground truth from the volume, for use after
 # any RescanStep
 # ----------------------------------------------------------------------
-
 def _rescan_chunk(origin, far_corner, source_io: DataIO) -> pd.DataFrame:
     data = source_io.get_data(get_slice(origin, far_corner))
     nz = np.nonzero(data)
@@ -383,38 +422,47 @@ def rescan_metadata(ctx: PostprocessParams) -> pd.DataFrame:
     return result[_COLUMNS]
 
 
-# todo: each outputvolume needs a dedicated instance object metafile. If the input volume does not get overwritten by the postporcessing a dedicated metadata file needs to be written
-# todo: require output_metapath to be set if a new volume dest_path is given in the config
-
 # ----------------------------------------------------------------------
 # Runner
 # ----------------------------------------------------------------------
-
 def run_postprocessing(steps: list, ctx: PostprocessParams,
                        metadata_path: Union[str, Path],
                        output_metadata_path: Optional[str] = None) -> tuple:
-    """Run steps in order. Metadata is only rescanned when a RescanStep
-    has actually run since the last accurate metadata was available --
-    consecutive RescanSteps share a single rescan afterward rather than
-    one each."""
+    if ctx.allow_overwrite and len(steps) > 1:
+        raise ValueError(
+            "allow_overwrite=True is only valid for a single-step run -- "
+            "with several chained steps, each intermediate needs its own "
+            "store or a later step's halo reads can race an earlier "
+            "step's in-flight writes to the same one."
+        )
+
     metadata_df = pd.read_parquet(metadata_path)
     dirty = False
 
-    for step in steps:
+    for idx, step in enumerate(steps):
+        is_last = idx == len(steps) - 1
+
         if isinstance(step, TargetedStep) and dirty:
             metadata_df = rescan_metadata(ctx)
             dirty = False
-        elif isinstance(step, RescanStep):
+
+        step.dest_path = _resolve_step_dest(step, ctx, idx, is_last)
+
+        if isinstance(step, RescanStep):
             print(f"--- {step.name} (volume) ---")
             ctx.instance_vol = step.apply_to_volume(ctx)
             dirty = True
+
         elif isinstance(step, TargetedStep):
             print(f"--- {step.name} (metadata-targeted) ---")
             metadata_df = step.apply(ctx, metadata_df)
+            if step.wrote_volume and Path(step.dest_path) != Path(
+                    ctx.instance_vol.zarr_path):
+                ctx.instance_vol = Zarr2DataIO(Path(step.dest_path),
+                                               chunk_size=ctx.chunk_size)
         else:
             raise TypeError(
                 f"step {step!r} is neither a RescanStep nor a TargetedStep")
-
 
     if dirty:
         metadata_df = rescan_metadata(ctx)
@@ -424,17 +472,51 @@ def run_postprocessing(steps: list, ctx: PostprocessParams,
     metadata_df.to_parquet(tmp, index=False)
     tmp.replace(metadata_path)
 
+    output_exists = Path(ctx.output_vol_path) == Path(
+        ctx.instance_vol.zarr_path) or \
+                    Path(ctx.output_vol_path).exists()
+
+    if ctx.cleanup_scratch:
+        removed = cleanup_intermediate(ctx, ctx.output_vol_path)
+        if ctx.verbose and removed:
+            print(f"Removed {len(removed)} intermediate scratch artifacts",
+                  flush=True)
+
+    if not output_exists and ctx.require_output_at_path:
+        raise OutputVolumeNotWritten(ctx.output_vol_path,
+                                     ctx.instance_vol.zarr_path)
+
     return ctx.instance_vol, metadata_df
 
 
 # ----------------------------------------------------------------------
 # CLI
 # ----------------------------------------------------------------------
-
 STEP_REGISTRY = {
     "expand_labels": ExpandLabelsStep,
     "size_filter": SizeFilterStep,
 }
+
+
+def _default_step_dest(ctx: PostprocessParams, idx: int,
+                       step_name: str) -> Path:
+    """Private scratch destination for one step -- distinct from both
+    its own source and any other step's output, so halo reads can
+    never race against in-flight writes."""
+    return ctx.scratch_dir / f"step{idx:02d}_{step_name}.zarr"
+
+
+def _resolve_step_dest(step, ctx: PostprocessParams, idx: int,
+                       is_last: bool) -> Path:
+    if step.dest_path is not None:
+        return resolve_path(step.dest_path,
+                            default_path=ctx.instance_vol.zarr_path,
+                            base_dir=ctx.scratch_dir.parent)
+    if ctx.allow_overwrite:
+        return Path(ctx.instance_vol.zarr_path)
+    if is_last and ctx.output_vol_path is not None:
+        return Path(ctx.output_vol_path)
+    return _default_step_dest(ctx, idx, step.name)
 
 
 def build_steps(step_configs: list) -> list:
@@ -451,21 +533,54 @@ def build_steps(step_configs: list) -> list:
     return steps
 
 
+def _default_output_vol_path(instance_vol_path: Path, steps: list,
+                             project_dir: Path) -> Path:
+    step_names = "_".join(s["type"] for s in steps)
+    return project_dir / f"{instance_vol_path.stem}_{step_names}.zarr"
+
+
+def _resolve_step_dest(step, ctx: PostprocessParams, idx: int,
+                       is_last: bool) -> Path:
+    if step.dest_path is not None:
+        return resolve_path(step.dest_path,
+                            default_path=ctx.instance_vol.zarr_path,
+                            base_dir=ctx.scratch_dir.parent)
+    if is_last:
+        return Path(ctx.output_vol_path)
+    return _default_step_dest(ctx, idx, step.name)
+
+
+def cleanup_intermediate(ctx: PostprocessParams, final_vol_path: Path) -> list:
+    """Remove per-step scratch artifacts once the run has finished and
+    the final volume + metadata are confirmed written: progress-marker
+    directories for every step, and any private intermediate zarr store
+    created by _default_step_dest. Never touches anything outside
+    ctx.scratch_dir, so the original input volume and the promoted
+    final_vol_path (which normally live in project_dir, not scratch)
+    are never candidates for removal even if matched by accident."""
+    final_vol_path = Path(final_vol_path).resolve()
+    removed = []
+    for pattern in ("progress_postprocess_*", "step*.zarr"):
+        for p in ctx.scratch_dir.glob(pattern):
+            if p.resolve() == final_vol_path:
+                continue
+            if p.is_dir():
+                shutil.rmtree(p)
+            else:
+                p.unlink()
+            removed.append(p)
+    return removed
+
+
 def parse_postprocess_cfg(pp_cfg: dict) -> tuple:
-    """
-    Loads the original pipeline run configuration and builds the postprocessing
-    context directly from it to guarantee analytical consistency.
-    """
     if "pipeline_config" not in pp_cfg:
         raise KeyError(
             "Post-processing config must include 'pipeline_config' pointing to the original run's YAML.")
 
-    # 1. Load and parse the original pipeline configuration
     run_cfg_path = Path(pp_cfg["pipeline_config"])
     with open(run_cfg_path, 'r') as f:
         run_cfg = yaml.safe_load(f)
 
-    # Use the pipeline's exact logic to resolve paths, defaults, and data IO
     instance_params = parse_cfg(run_cfg)
     project_dir = Path(run_cfg["project_dir"])
 
@@ -474,39 +589,44 @@ def parse_postprocess_cfg(pp_cfg: dict) -> tuple:
         stack_dim = np.array([[0, 0, 0], instance_params.output_data.shape],
                              dtype=np.int64)
 
-    # 2. Build context strictly from the pipeline's validated parameters
-    # The pipeline's output_data (instance_vol) automatically becomes the post-processor's source io_func.
+    steps = pp_cfg.get("steps", [])
+    allow_overwrite = pp_cfg.get("allow_overwrite", False)
+    instance_vol_path = Path(instance_params.output_data.zarr_path)
+
+    out_vol = pp_cfg.get("output_vol_path")
+    if out_vol is not None:
+        output_vol_path = resolve_path(out_vol, default_path=None,
+                                       base_dir=project_dir)
+    elif allow_overwrite:
+        output_vol_path = instance_vol_path
+    else:
+        output_vol_path = _default_output_vol_path(instance_vol_path, steps,
+                                                   project_dir)
+
     context = PostprocessParams(
         instance_vol=instance_params.output_data,
         chunk_size=instance_params.chunk_size,
         stack_dim=stack_dim,
         scratch_dir=instance_params.scratch_dir,
+        output_vol_path=output_vol_path,
+        allow_overwrite=allow_overwrite,
+        cleanup_scratch=pp_cfg.get("cleanup_scratch", True),
         parallel_backend=instance_params.parallel_backend,
         n_jobs=pp_cfg.get("n_jobs", run_cfg.get("n_jobs", -1)),
-        verbose=instance_params.verbose
+        verbose=instance_params.verbose,
     )
 
-    # 3. Resolve post-processing specific variables
     metadata_path = instance_params.metadata_path
     out_meta = pp_cfg.get("output_metadata_path")
-    # output_metadata_path = resolve_path(out_meta, default_path=metadata_path,
-    #                                     base_dir=project_dir) if out_meta else None
-
-    steps = pp_cfg.get("steps", [])
-    dest_paths = [step.get("dest_path") for step in steps if
-                  step.get("dest_path")]
-    last_dest_path = dest_paths[-1] if dest_paths else None
-
     if out_meta:
-        meta_root = Path(last_dest_path).parent if last_dest_path else project_dir # will
-        # Derived automatically from the volume destination filename
-        default_meta_name = Path(last_dest_path).stem + "_metadata.parquet"
-        output_metadata_path = resolve_path(out_meta,
-                                            default_path= meta_root / default_meta_name,
+        output_metadata_path = resolve_path(out_meta, default_path=None,
                                             base_dir=project_dir)
-    else:
-        # No new volume destination; fallback to updating original metadata
+    elif output_vol_path == instance_vol_path:
+        # True in-place overwrite: keep updating the original metadata
+        # file regardless of what naming convention it happened to use.
         output_metadata_path = metadata_path
+    else:
+        output_metadata_path = output_vol_path.parent / f"{output_vol_path.stem}_metadata.parquet"
 
     return context, metadata_path, output_metadata_path, steps
 

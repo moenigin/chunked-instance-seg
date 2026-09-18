@@ -3,11 +3,13 @@
 # ==========================================
 
 # Inheritance
-pipeline_config: "/path/to/my_project/pipeline_config.yaml"
+pipeline_config: /path/to/my_project/run_config.yaml
 
 # Overrides (Optional)
-# output_metadata_path: "filtered_meta.parquet" # Defaults to overwriting the pipeline's metadata_path
-# n_jobs: 8                                    # Overrides the n_jobs defined in pipeline_config
+# n_jobs: /1                                    # Overrides the n_jobs defined in pipeline_config
+# allow_overwrite: false
+# output_vol_path: #custom output path
+# output_metadata_path: "filtered_meta.parquet"#custom output path
 
 # Actions
 steps:
@@ -18,6 +20,5 @@ steps:
 
   # RescanStep: Expands labels. Writes a NEW volume and triggers a full metadata rescan afterward.
   - type: "expand_labels"
-    distance: 2
-    dest_path: "/path/to/my_project/expanded_instances.zarr"
-    # halo: 3                                  # Optional: Padding for chunk-boundary overlap
+    distance: 3
+    halo: 4  # Optional: Padding for chunk-boundary overlap, defaults to distance setting
