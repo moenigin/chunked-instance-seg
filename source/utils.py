@@ -80,7 +80,8 @@ class IDScheme:
             (tuple(int(c) for c in origin) for origin in chunk_origins)
         )
         self._origin_to_key = {origin: i for i, origin in enumerate(ordered)}
-        self._key_to_origin = {i: np.array(o) for o, i in self._origin_to_key.items()}
+        self._key_to_origin = {i: np.array(o) for o, i in
+                               self._origin_to_key.items()}
 
         self.n_chunks = len(ordered)
         if self.n_chunks == 0:
@@ -160,10 +161,12 @@ def generate_chunks(stack_dim: np.ndarray[int], chunk_size: np.ndarray[int]) -> 
     return np.array(list(zip(origins, far_corners)))
 
 
-def get_zarr_array(output_fn, zarr_chunks: Optional[list[int]] = None,
-                   data_dim: Optional[tuple[int, int, int]] = None,
-                   dtype_: Optional[type] = None, opening_mode: str = 'a',
-                   voxel_size: Optional[tuple[int, int, int]] = (25, 9, 9)):
+def get_or_create_zarr_array(output_fn: Union[str, Path],
+                             zarr_chunks: Optional[list[int]] = None,
+                             data_dim: Optional[tuple[int, int, int]] = None,
+                             dtype_: Optional[type] = None,
+                             opening_mode: str = 'a',
+                             voxel_size: Optional[tuple[int, int, int]] = (25, 9, 9)) -> zarr.Array:
     """
     :param output_fn:
     :param zarr_chunks:
@@ -177,60 +180,59 @@ def get_zarr_array(output_fn, zarr_chunks: Optional[list[int]] = None,
     if '0' in zarr_group:
         return zarr_group['0']
 
-    try:
-        assert zarr_chunks is not None and data_dim is not None and dtype_ is not None, \
-            "both zarr_chunks, data_dim and dtype_ need to be given when a new array is created"
+    assert zarr_chunks is not None and data_dim is not None and dtype_ is not None, \
+        "both zarr_chunks, data_dim and dtype_ need to be given when a new array is created"
 
-        output_dataset = zarr_group.create_dataset(
-            name="0",
-            shape=data_dim,
-            chunks=zarr_chunks,
-            dtype=dtype_,
-            cache_attrs=False,
-            compressor=Blosc(cname='zstd', clevel=3, shuffle=Blosc.SHUFFLE),
-            fill_value=0,
-            write_empty_chunks=False,
-            overwrite=False,
-            dimension_separator='/',
-        )
-        metadata = {
-            "multiscales": [
-                {"axes": [
-                    {"name": "z", "type": "space", "unit": "nanometer"},
-                    {"name": "y", "type": "space", "unit": "nanometer"},
-                    {"name": "x", "type": "space", "unit": "nanometer"}
-                ],
-                    "datasets": [{"coordinateTransformations": [
-                        {"scale": voxel_size, "type": "scale"}],
-                        "path": "0"}], "version": "0.4"}]
-        }
-        zarr_group.attrs.put(metadata)
-
-    except zarr.errors.ContainsArrayError: # do we really want this here?
-        # Another process created it in the meantime
-        return zarr_group['0']
+    output_dataset = zarr_group.create_dataset(
+        name="0",
+        shape=data_dim,
+        chunks=zarr_chunks,
+        dtype=dtype_,
+        cache_attrs=False,
+        compressor=Blosc(cname='zstd', clevel=3, shuffle=Blosc.SHUFFLE),
+        fill_value=0,
+        write_empty_chunks=False,
+        overwrite=False,
+        dimension_separator='/',
+    )
+    metadata = {
+        "multiscales": [
+            {"axes": [
+                {"name": "z", "type": "space", "unit": "nanometer"},
+                {"name": "y", "type": "space", "unit": "nanometer"},
+                {"name": "x", "type": "space", "unit": "nanometer"}
+            ],
+                "datasets": [{"coordinateTransformations": [
+                    {"scale": voxel_size, "type": "scale"}],
+                    "path": "0"}], "version": "0.4"}]
+    }
+    zarr_group.attrs.put(metadata)
     return output_dataset
 
 
-def mark_completed(chunk_coords, progress_dir="progress/"):
+def _chunk_id(chunk_coords) -> str:
+    """Human-readable id for a chunk bbox."""
+    return "_".join(str(int(c)) for c in np.asarray(chunk_coords).flatten())
+
+
+def mark_completed(chunk_coords, progress_dir):
     Path(progress_dir).mkdir(exist_ok=True)
-    chunk_hash = hash(tuple(chunk_coords.flatten()))
-    Path(f"{progress_dir}/{chunk_hash}.done").touch()
+    Path(progress_dir, f"{_chunk_id(chunk_coords)}.done").touch()
 
 
-def filter_remaining_chunks(all_chunks, progress_dir="progress/"):
-    if not Path(progress_dir).exists():
+def filter_remaining_chunks(all_chunks: list, progress_dir: Union[Path, str]) -> list:
+    progress_dir = Path(progress_dir)
+    if not progress_dir.exists():
         return all_chunks
-
-    completed_hashes = {int(f.stem) for f in Path(progress_dir).glob("*.done")}
-    return [chunk for chunk in all_chunks
-            if hash(tuple(chunk.flatten())) not in completed_hashes]
+    completed = {f.stem for f in progress_dir.glob("*.done")}
+    return [c for c in all_chunks if _chunk_id(c) not in completed]
 
 
 def mk_dir(path: Union[str, Path]) -> Path:
     path = Path(path)
     path.mkdir(exist_ok=True, parents=True)
     return path
+
 
 def resolve_path(val: str | None, default_path: Path, base_dir: Path) -> Path:
     if not val:

@@ -4,7 +4,7 @@ from typing import Optional
 
 import numpy as np
 
-from source.utils import get_zarr_array
+from source.utils import get_or_create_zarr_array
 
 
 class DataIO(ABC):
@@ -27,12 +27,12 @@ class Zarr2DataIO(DataIO):
                  array_shape: Optional[tuple] = None):
         self.zarr_path = Path(zarr_name)
         if self.zarr_path.exists():
-            self.zarr_array = get_zarr_array(zarr_name, opening_mode='r+')
+            self.zarr_array = get_or_create_zarr_array(zarr_name, opening_mode='r+')
         else:
             assert chunk_size is not None and array_shape is not None, \
                 "both chunk_size and array_shape need to be given when a new array is created"
-            self.zarr_array = get_zarr_array(zarr_name, chunk_size, array_shape,
-                                              dtype_=np.uint64)
+            self.zarr_array = get_or_create_zarr_array(zarr_name, chunk_size, array_shape,
+                                                       dtype_=np.uint64)
 
     @property
     def shape(self):
