@@ -81,7 +81,8 @@ class InstanceParams:
     cleanup_chunk_metadata: bool = True  # delete per-chunk Parquet files once consolidated (see note in run_pipeline_parallel)
     verbose: bool = False
     generate_report: bool = True
-    report_dir: Optional[Union[str, Path]] = None  # defaults to metadata_path.parent / "report"
+    report_dir: Optional[
+        Union[str, Path]] = None  # defaults to metadata_path.parent / "report"
     list_empty_chunks: bool = False
     delete_scratch: bool = False
 
@@ -222,40 +223,59 @@ class InstanceSegmentationPipeline:
 
         semantic_chunk = self.semanticIO.get_data(src_slice)
         binary_mask = (semantic_chunk == self.target_label)
-        labeled_chunk, n_objects = ndimage.label(binary_mask)
 
-        if n_objects > 0:
-            sizes = ndimage.sum(binary_mask, labeled_chunk,
-                                range(1, n_objects + 1))
-            remove_idx = np.where(sizes < self.min_object_size)[0] + 1
-            labeled_chunk[np.isin(labeled_chunk, remove_idx)] = 0
-            labeled_chunk, n_objects = ndimage.label(labeled_chunk > 0)
-
+        labeled, n_objects = ndimage.label(binary_mask)
         objects_metadata = []
-        if n_objects > 0:
-            chunk_key = self.id_scheme.chunk_key(origin)
-            final_label_chunk = np.zeros_like(labeled_chunk, dtype=np.int64)
-            for local_id in range(1, n_objects + 1):
-                # Raises loudly (see id_utils.IDScheme.pack) rather than
-                # silently colliding if this chunk exceeds the assumed
-                # per-chunk object budget.
-                object_id = self.id_scheme.pack(chunk_key, local_id)
-                obj_mask = labeled_chunk == local_id
-                final_label_chunk[obj_mask] = object_id
-                coords = np.where(obj_mask)
-                bbox = (
-                    int(origin[0] + coords[0].min()),
-                    int(origin[1] + coords[1].min()),
-                    int(origin[2] + coords[2].min()),
-                    int(origin[0] + coords[0].max()),
-                    int(origin[1] + coords[1].max()),
-                    int(origin[2] + coords[2].max()),
-                )
-                objects_metadata.append(
-                    ObjectMetadata(object_id, chunk_id, bbox,
-                                   int(obj_mask.sum())))
-
-            self.instancesIO.write_data(final_label_chunk, targ_slice)
+        if n_objects:
+            sizes = np.bincount(labeled.ravel(), minlength=n_objects + 1)
+            kept = np.flatnonzero(sizes >= self.min_object_size)
+            kept = kept[kept > 0]
+            if kept.size:
+                chunk_key = self.id_scheme.chunk_key(origin)
+                ids = self.id_scheme.pack(chunk_key, np.arange(1,kept.size + 1))  # vectorised, must still raise on overflow
+                lut = np.zeros(n_objects + 1, dtype=np.int64)
+                lut[kept] = ids
+                final_label_chunk = lut[labeled]
+                boxes = ndimage.find_objects(labeled) # bboxes for all labels in one pass
+                for old, oid in zip(kept, ids):
+                    sl = boxes[old - 1]
+                    bbox = tuple(int(origin[i] + sl[i].start) for i in range(3)) \
+                           + tuple(int(origin[i] + sl[i].stop - 1) for i in range(3))
+                    objects_metadata.append(
+                        ObjectMetadata(int(oid), chunk_id, bbox, int(sizes[old])))
+                self.instancesIO.write_data(final_label_chunk, targ_slice)
+        # if n_objects > 0:
+        #     sizes = ndimage.sum(binary_mask, labeled_chunk,
+        #                         range(1, n_objects + 1))
+        #     remove_idx = np.where(sizes < self.min_object_size)[0] + 1
+        #     labeled_chunk[np.isin(labeled_chunk, remove_idx)] = 0
+        #     labeled_chunk, n_objects = ndimage.label(labeled_chunk > 0)
+        #
+        # objects_metadata = []
+        # if n_objects > 0:
+        #     chunk_key = self.id_scheme.chunk_key(origin)
+        #     final_label_chunk = np.zeros_like(labeled_chunk, dtype=np.int64)
+        #     for local_id in range(1, n_objects + 1):
+        #         # Raises loudly (see id_utils.IDScheme.pack) rather than
+        #         # silently colliding if this chunk exceeds the assumed
+        #         # per-chunk object budget.
+        #         object_id = self.id_scheme.pack(chunk_key, local_id)
+        #         obj_mask = labeled_chunk == local_id
+        #         final_label_chunk[obj_mask] = object_id
+        #         coords = np.where(obj_mask)
+        #         bbox = (
+        #             int(origin[0] + coords[0].min()),
+        #             int(origin[1] + coords[1].min()),
+        #             int(origin[2] + coords[2].min()),
+        #             int(origin[0] + coords[0].max()),
+        #             int(origin[1] + coords[1].max()),
+        #             int(origin[2] + coords[2].max()),
+        #         )
+        #         objects_metadata.append(
+        #             ObjectMetadata(object_id, chunk_id, bbox,
+        #                            int(obj_mask.sum())))
+        #
+        #     self.instancesIO.write_data(final_label_chunk, targ_slice)
 
         # Written even when there are zero objects, so downstream reads
         # of this chunk's metadata (e.g. during merge-row computation)
@@ -271,7 +291,6 @@ class InstanceSegmentationPipeline:
 
         mark_completed(chunk_coords=np.array([origin, far_corner]),
                        progress_dir=self.progress_dir_pass1)
-        return objects_metadata
 
     def run_instance_pass1(self, n_jobs: int = -1):
         print("Starting parallelized instance segmentation pipeline...")
@@ -511,11 +530,30 @@ class InstanceSegmentationPipeline:
             old: new for old, new in resolved_mapping.items()
             if self.id_scheme.unpack_chunk_key(old) == chunk_key
         }
+
+        # if local_mapping:
+        #     chunk_slice = self.get_chunk_slice(origin, far_corner)
+        #     chunk_data = self.instancesIO.get_data(chunk_slice)
+        #     for old_id, new_id in local_mapping.items():
+        #         chunk_data[chunk_data == old_id] = new_id
         if local_mapping:
             chunk_slice = self.get_chunk_slice(origin, far_corner)
             chunk_data = self.instancesIO.get_data(chunk_slice)
-            for old_id, new_id in local_mapping.items():
-                chunk_data[chunk_data == old_id] = new_id
+
+            # 1. Convert mapping dict to arrays sorted by old_id
+            old_ids_sorted, new_ids_sorted = np.array(sorted(local_mapping.items()), dtype=chunk_data.dtype).T
+
+            # 2. Find insertion positions of chunk elements in old_ids_sorted
+            idx = np.searchsorted(old_ids_sorted, chunk_data)
+
+            # 3. Guard against out-of-bounds indices
+            idx_clipped = np.clip(idx, 0, len(old_ids_sorted) - 1)
+
+            # 4. Mask elements that actually match an old_id in local_mapping
+            mask = (old_ids_sorted[idx_clipped] == chunk_data)
+
+            # 5. Replace matching IDs in-place
+            chunk_data[mask] = new_ids_sorted[idx_clipped[mask]]
             self.instancesIO.write_data(chunk_data, chunk_slice)
 
         if self.verbose:
@@ -638,7 +676,8 @@ class InstanceSegmentationPipeline:
         # cleanup_chunk_files() only ever deletes files once that final
         # copy of the data is confirmed present, and it's a no-op if
         # there's nothing left to remove.
-        print(f"DEBUG InstanceSegmentationPipeline.run_pipeline_parallel self.cleanup_chunk_metadata {self.cleanup_chunk_metadata}")
+        print(
+            f"DEBUG InstanceSegmentationPipeline.run_pipeline_parallel self.cleanup_chunk_metadata {self.cleanup_chunk_metadata}")
         if self.cleanup_chunk_metadata:
             n_removed = self.meta_store.cleanup_chunk_files()
             if self.verbose and n_removed:

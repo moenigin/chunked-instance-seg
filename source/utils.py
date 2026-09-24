@@ -59,6 +59,11 @@ from typing import Sequence, Optional, Union
 
 TOTAL_ID_BITS = 63  # keep every id within the positive range of int64
 
+def int2list(item):
+    if isinstance(item, int):
+        return [item]
+    else:
+        return item
 
 class IDScheme:
     """
@@ -122,18 +127,25 @@ class IDScheme:
 
     def pack(self, chunk_key: int, local_label: int) -> int:
         """Combine a chunk_key and a chunk-local label into a global id."""
-        if not (1 <= local_label < self.max_objects_per_chunk):
+        labels = np.asarray(int2list(local_label), dtype=np.int64)
+        if labels.size and (
+                labels.min() < 1 or labels.max() >= self.max_objects_per_chunk):
             raise RuntimeError(
-                f"chunk_key={chunk_key} produced local label "
-                f"{local_label}, which exceeds the assumed maximum of "
-                f"{self.max_objects_per_chunk} objects per chunk "
-                f"({self.local_bits}-bit local id space, derived from "
-                f"{self.n_chunks} total chunks). Reduce chunk_size to "
-                f"lower the number of objects per chunk -- the pipeline "
-                f"cannot guarantee unique ids past this point and is "
-                f"stopping rather than silently corrupting labels."
-            )
-        return (chunk_key << self.local_bits) | local_label
+                "too many objects in chunk")  # same message as pack()
+        return (np.int64(chunk_key) << self.local_bits) | labels
+
+        # if not (1 <= local_label < self.max_objects_per_chunk):
+        #     raise RuntimeError(
+        #         f"chunk_key={chunk_key} produced local label "
+        #         f"{local_label}, which exceeds the assumed maximum of "
+        #         f"{self.max_objects_per_chunk} objects per chunk "
+        #         f"({self.local_bits}-bit local id space, derived from "
+        #         f"{self.n_chunks} total chunks). Reduce chunk_size to "
+        #         f"lower the number of objects per chunk -- the pipeline "
+        #         f"cannot guarantee unique ids past this point and is "
+        #         f"stopping rather than silently corrupting labels."
+        #     )
+        # return (chunk_key << self.local_bits) | local_label
 
     def unpack_chunk_key(self, object_id: int) -> int:
         """Recover which chunk an object id was created in."""
