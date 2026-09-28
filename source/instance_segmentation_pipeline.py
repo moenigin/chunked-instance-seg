@@ -1,60 +1,21 @@
-"""
-Chunked instance segmentation pipeline.
-
-WHAT CHANGED FROM THE ORIGINAL, AND WHY
------------------------------------------
-1. Object ids are bit-packed (see id_utils.IDScheme), computed locally
-   by each chunk from its own coordinates -- no shared counter, no lock,
-   nothing to restore correctly on resume. See id_utils.py for the full
-   design writeup and the one checked assumption it makes.
-
-2. Metadata is one Parquet file per chunk (see metadata_handler.py),
-   written independently -- no shared file, no lock on the write path.
-   Merges are resolved into a small separate table and everything is
-   streamed into a single consolidated Parquet file once, after Pass 3.
-
-3. `_find_connected_across_boundary` is vectorized (was a pure-Python
-   double loop over every boundary pixel, which doesn't release the GIL
-   and would have serialized under threads regardless of core count).
-
-4. No `threading.Lock` or `multiprocessing.Value` anywhere -- there is
-   no shared mutable state left to protect, so the pipeline runs
-   correctly under joblib's process-based 'loky' backend as well as
-   'threading'. Pick with `InstanceParams.parallel_backend`.
-
-5. Resumability is designed in at every stage, not bolted on:
-   - Pass 1: per-chunk id assignment is a pure function of chunk
-     coordinates, so re-running an interrupted chunk reproduces the
-     exact same ids/metadata/labels -- reprocessing is always safe,
-     never duplicative.
-   - Pass 2 (boundary pairs): each chunk-pair's result is its own small
-     Parquet file; a pair already on disk is skipped. The union-find
-     consolidation into a final id_mapping is itself cheap enough that
-     on resume it's simply redone from the persisted pair files rather
-     than checkpointed mid-way.
-   - Pass 3 (relabeling): which chunks need touching is derived purely
-     by arithmetic from the ids in id_mapping (id >> local_bits =
-     chunk_key) -- no metadata scan needed to find them. Each chunk's
-     relabeling is its own resumable unit, same pattern as Pass 1.
-   - Merge-metadata computation and final consolidation are each a
-     single cheap step, checked for existence before running, and
-     written via temp-file-then-rename so a crash never leaves a
-     partial result that could be mistaken for a finished one.
-"""
 import datetime
-import shutil
-import time
-
 import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+import shutil
+import time
 import yaml
 
 from argparse import ArgumentParser, BooleanOptionalAction
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, fields
 from joblib import Parallel, delayed
 from pathlib import Path
 from scipy import ndimage
+from scipy.sparse import coo_matrix
+from scipy.sparse.csgraph import connected_components
 from tqdm import tqdm
 from typing import Optional, Union
 
@@ -162,17 +123,14 @@ class InstanceSegmentationPipeline:
 
         # One IDScheme built from the full, deterministic chunk list --
         # every chunk must agree on the same chunk_key <-> origin mapping
-        # for resuming to be safe, so build this once, up front.
-
-        all_chunks = generate_chunks(self.stack_dim, self.chunk_size)
-        self.id_scheme = IDScheme([origin for origin, _ in all_chunks])
+        # for resuming to be safe, however building it once resulted
+        self.id_scheme = IDScheme(self.stack_dim, self.chunk_size) #
         if self.verbose:
             print(f"ID scheme: {self.id_scheme.describe()}", flush=True)
 
     # ------------------------------------------------------------------
     # shared helpers
     # ------------------------------------------------------------------
-
     def get_chunk_list(self, dir_) -> list:
         """Retrieve list of chunks from the progress directory"""
         chunk_list = generate_chunks(self.stack_dim, self.chunk_size)
@@ -201,9 +159,7 @@ class InstanceSegmentationPipeline:
     # ------------------------------------------------------------------
     # Pass 1: per-chunk semantic -> instance segmentation
     # ------------------------------------------------------------------
-
-    def mk_chunk_instances(self, origin: np.ndarray,
-                           far_corner: np.ndarray) -> list:
+    def mk_chunk_instances(self, origin: np.ndarray, far_corner: np.ndarray):
         """Process a single chunk: semantic -> instance segmentation.
         Fully self-contained -- the only external state it reads is the
         (already-finalized, never-modified-by-this-pass) semantic input
@@ -244,53 +200,18 @@ class InstanceSegmentationPipeline:
                     objects_metadata.append(
                         ObjectMetadata(int(oid), chunk_id, bbox, int(sizes[old])))
                 self.instancesIO.write_data(final_label_chunk, targ_slice)
-        # if n_objects > 0:
-        #     sizes = ndimage.sum(binary_mask, labeled_chunk,
-        #                         range(1, n_objects + 1))
-        #     remove_idx = np.where(sizes < self.min_object_size)[0] + 1
-        #     labeled_chunk[np.isin(labeled_chunk, remove_idx)] = 0
-        #     labeled_chunk, n_objects = ndimage.label(labeled_chunk > 0)
-        #
-        # objects_metadata = []
-        # if n_objects > 0:
-        #     chunk_key = self.id_scheme.chunk_key(origin)
-        #     final_label_chunk = np.zeros_like(labeled_chunk, dtype=np.int64)
-        #     for local_id in range(1, n_objects + 1):
-        #         # Raises loudly (see id_utils.IDScheme.pack) rather than
-        #         # silently colliding if this chunk exceeds the assumed
-        #         # per-chunk object budget.
-        #         object_id = self.id_scheme.pack(chunk_key, local_id)
-        #         obj_mask = labeled_chunk == local_id
-        #         final_label_chunk[obj_mask] = object_id
-        #         coords = np.where(obj_mask)
-        #         bbox = (
-        #             int(origin[0] + coords[0].min()),
-        #             int(origin[1] + coords[1].min()),
-        #             int(origin[2] + coords[2].min()),
-        #             int(origin[0] + coords[0].max()),
-        #             int(origin[1] + coords[1].max()),
-        #             int(origin[2] + coords[2].max()),
-        #         )
-        #         objects_metadata.append(
-        #             ObjectMetadata(object_id, chunk_id, bbox,
-        #                            int(obj_mask.sum())))
-        #
-        #     self.instancesIO.write_data(final_label_chunk, targ_slice)
 
-        # Written even when there are zero objects, so downstream reads
-        # of this chunk's metadata (e.g. during merge-row computation)
-        # never have to distinguish "not processed yet" from "processed,
-        # nothing here".
         self.meta_store.write_chunk_metadata(chunk_id, objects_metadata)
 
         if self.verbose:
             duration = (datetime.datetime.now() - start_time).total_seconds()
             print(
-                f"Created instances for chunk {origin} in {duration:.2f} seconds",
+                f"Created instances for chunk {origin} with {n_objects} objects in {duration:.2f} seconds",
                 flush=True)
 
         mark_completed(chunk_coords=np.array([origin, far_corner]),
                        progress_dir=self.progress_dir_pass1)
+
 
     def run_instance_pass1(self, n_jobs: int = -1):
         print("Starting parallelized instance segmentation pipeline...")
@@ -305,7 +226,6 @@ class InstanceSegmentationPipeline:
     # ------------------------------------------------------------------
     # Pass 2: find objects connected across chunk boundaries
     # ------------------------------------------------------------------
-
     def get_neighboring_chunks(self, origin: np.ndarray,
                                far_corner: np.ndarray) -> list:
         """Get neighboring chunks that share boundaries (+z, +y, +x only,
@@ -428,207 +348,193 @@ class InstanceSegmentationPipeline:
                 id_mapping[obj_id], id_mapping)
         return id_mapping[obj_id]
 
-    def _consolidate_id_mapping(self) -> dict:
-        """Single-process step: read every persisted boundary-pair file
-        and build the final, fully-resolved union-find mapping (root =
-        lowest id in each merged group -- guaranteed by always attaching
-        the larger root under the smaller at each union). Cheap relative
-        to the per-voxel passes, so on resume it's simply recomputed in
-        full from the persisted pair files rather than checkpointed
-        itself."""
+    def _read_pair_files(self, max_workers: int = 16):
+        files = sorted(self.progress_dir_cc_analysis.glob("pairs_*.parquet"))
+
+        def _read(path):
+            t = pq.read_table(path)
+            return (t["id1"].to_numpy().astype(np.int64),
+                    t["id2"].to_numpy().astype(np.int64))
+
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            parts = list(pool.map(_read, files))
+        if not parts:
+            return np.empty(0, np.int64), np.empty(0, np.int64)
+        return (np.concatenate([p[0] for p in parts]),
+                np.concatenate([p[1] for p in parts]))
+
+    def _consolidate_id_mapping(self):
+        """Returns (old, new): int64 arrays sorted by old.  root = smallest id
+        of each merged group; only non-root ids appear in `old`."""
         if self.id_mapping_file.exists():
-            df = pd.read_parquet(self.id_mapping_file)
-            return dict(zip(df["old_id"].tolist(), df["new_id"].tolist()))
+            t = pq.read_table(self.id_mapping_file)
+            return (t["old_id"].to_numpy().astype(np.int64),
+                    t["new_id"].to_numpy().astype(np.int64))
 
-        raw_mapping: dict = {}
-        for pair_file in sorted(
-                self.progress_dir_cc_analysis.glob("pairs_*.parquet")):
-            df = pd.read_parquet(pair_file)
-            for id1, id2 in zip(df["id1"].tolist(), df["id2"].tolist()):
-                root1 = self._find_root(int(id1), raw_mapping)
-                root2 = self._find_root(int(id2), raw_mapping)
-                if root1 != root2:
-                    new_root, old_root = (root1, root2) if root1 < root2 else (
-                        root2, root1)
-                    raw_mapping[old_root] = new_root
-
-        # Fully resolve every key to its true final root -- path
-        # compression during the loop above doesn't guarantee every
-        # entry is flattened by the time we're done, so resolve
-        # explicitly rather than trusting raw dict values directly.
-        resolved = {old: self._find_root(old, raw_mapping) for old in
-                    raw_mapping}
-
-        if resolved:
-            out_df = pd.DataFrame({
-                "old_id": list(resolved.keys()),
-                "new_id": list(resolved.values()),
-            }).astype("int64")
+        id1, id2 = self._read_pair_files()
+        if id1.size == 0:
+            old = new = np.empty(0, np.int64)
         else:
-            out_df = pd.DataFrame({"old_id": pd.Series(dtype="int64"),
-                                   "new_id": pd.Series(dtype="int64")})
+            # dense 0..m-1 index per distinct id; `ids` is sorted ascending
+            ids, inv = np.unique(np.concatenate([id1, id2]),
+                                 return_inverse=True)
+            inv = inv.ravel()
+            a, b = inv[:id1.size], inv[id1.size:]
+            graph = coo_matrix((np.ones(a.size, dtype=np.int32), (a, b)),
+                               shape=(ids.size, ids.size))
+            _, comp = connected_components(graph, directed=False)
+            # first occurrence of each component in `comp` = lowest index =
+            # lowest id (because ids is sorted) -> that is the root
+            _, first = np.unique(comp, return_index=True)
+            root = ids[first][comp]
+            keep = ids != root
+            old, new = ids[keep], root[keep]
+
+        out = pa.table({"old_id": pa.array(old, type=pa.int64()),
+                        "new_id": pa.array(new, type=pa.int64())})
         tmp = self.id_mapping_file.with_suffix(".parquet.tmp")
-        out_df.to_parquet(tmp, index=False)
+        pq.write_table(out, tmp)
         tmp.replace(self.id_mapping_file)
-        return resolved
+        return old, new
 
-    def run_connected_component_analysis(self, n_jobs: int = -1) -> dict:
+    def run_connected_component_analysis(self, n_jobs: int = -1):
+        """Same as before, but returns (old, new) arrays."""
+        from source.utils import generate_chunks  # local import: patch file
         print("Pass 2: Finding connected components across boundaries...")
-
         if self.id_mapping_file.exists():
             print("id_mapping already computed, skipping boundary search")
             return self._consolidate_id_mapping()
 
         chunks = generate_chunks(self.stack_dim, self.chunk_size)
         chunk_pairs = self._build_chunk_pairs(chunks)
-        chunk_pairs = [p for p in chunk_pairs if
-                       not self._pair_file(p[0][0], p[1][0]).exists()]
-
+        chunk_pairs = [p for p in chunk_pairs
+                       if not self._pair_file(p[0][0], p[1][0]).exists()]
         if chunk_pairs:
             Parallel(n_jobs=n_jobs, backend=self.parallel_backend)(
                 delayed(self._find_connected_across_boundary)(o1, f1, o2, f2)
                 for (o1, f1), (o2, f2) in
-                tqdm(chunk_pairs, desc="find objects across chunk boundaries")
-            )
+                tqdm(chunk_pairs, desc="find objects across chunk boundaries"))
         else:
             print("All chunk pairs already processed")
-
         return self._consolidate_id_mapping()
 
     # ------------------------------------------------------------------
     # Pass 3: relabel affected chunks + compute merged metadata
     # ------------------------------------------------------------------
+    def _mapping_blocks(self, old):
+        """`old` is sorted, and the chunk key sits in the HIGH bits of every
+        id, so all ids of one chunk are adjacent.  Returns, per chunk that has
+        entries: (chunk_keys, block_start, block_end) into `old`/`new`."""
+        keys = self.id_scheme.unpack_chunk_key(old)
+        chunk_keys, first = np.unique(keys, return_index=True)
+        ends = np.append(first[1:], old.size)
+        return chunk_keys, first, ends
 
-    def get_affected_chunks(self, resolved_mapping: dict) -> list:
-        """Which chunks contain pixels that need relabeling -- derived
-        purely from the ids themselves (every id encodes its own
-        origin chunk), no metadata lookup needed.
+    def get_affected_chunks(self, chunk_keys) -> list:
+        origins = self.id_scheme.origins_for_keys(chunk_keys)
+        far = np.minimum(origins + self.chunk_size, self.stack_dim[1])
+        return [np.array([o, f]) for o, f in zip(origins, far)]
 
-        Returned in the same per-chunk shape generate_chunks() uses
-        (np.array([origin, far_corner]), not a (origin, far_corner)
-        tuple) -- filter_remaining_chunks/mark_completed hash this via
-        .flatten(), so it must match that shape exactly, the same way
-        Pass 1's chunk list already does."""
-        old_ids = set(resolved_mapping.keys())
-        chunk_keys = {self.id_scheme.unpack_chunk_key(i) for i in old_ids}
-        chunks = []
-        for key in chunk_keys:
-            origin = self.id_scheme.origin_for_key(key)
-            far_corner = np.minimum(origin + self.chunk_size, self.stack_dim[1])
-            chunks.append(np.array([origin, far_corner]))
-        return chunks
-
-    def _apply_relabelling(self, origin: np.ndarray, far_corner: np.ndarray,
-                           resolved_mapping: dict):
-        """Relabel a single chunk. Only entries whose OLD id actually
-        originates in this chunk are relevant (only those can appear as
-        pixel values here); the mapped-TO id may live anywhere and
-        doesn't need to already be present locally."""
+    def _apply_relabelling(self, origin, far_corner, old_block, new_block):
+        """Relabel one chunk with only ITS entries (old_block sorted)."""
+        import datetime
+        from source.utils import mark_completed
         start_time = datetime.datetime.now()
-        chunk_key = self.id_scheme.chunk_key(origin)
-        local_mapping = {
-            old: new for old, new in resolved_mapping.items()
-            if self.id_scheme.unpack_chunk_key(old) == chunk_key
-        }
-
-        # if local_mapping:
-        #     chunk_slice = self.get_chunk_slice(origin, far_corner)
-        #     chunk_data = self.instancesIO.get_data(chunk_slice)
-        #     for old_id, new_id in local_mapping.items():
-        #         chunk_data[chunk_data == old_id] = new_id
-        if local_mapping:
+        if old_block.size:
             chunk_slice = self.get_chunk_slice(origin, far_corner)
             chunk_data = self.instancesIO.get_data(chunk_slice)
-
-            # 1. Convert mapping dict to arrays sorted by old_id
-            old_ids_sorted, new_ids_sorted = np.array(sorted(local_mapping.items()), dtype=chunk_data.dtype).T
-
-            # 2. Find insertion positions of chunk elements in old_ids_sorted
-            idx = np.searchsorted(old_ids_sorted, chunk_data)
-
-            # 3. Guard against out-of-bounds indices
-            idx_clipped = np.clip(idx, 0, len(old_ids_sorted) - 1)
-
-            # 4. Mask elements that actually match an old_id in local_mapping
-            mask = (old_ids_sorted[idx_clipped] == chunk_data)
-
-            # 5. Replace matching IDs in-place
-            chunk_data[mask] = new_ids_sorted[idx_clipped[mask]]
+            old_b = old_block.astype(chunk_data.dtype, copy=False)
+            new_b = new_block.astype(chunk_data.dtype, copy=False)
+            nz = chunk_data != 0                 # background never matches
+            vals = chunk_data[nz]
+            pos = np.searchsorted(old_b, vals)   # binary search per voxel
+            pos[pos == old_b.size] = 0           # ids above every entry
+            hit = old_b[pos] == vals
+            vals[hit] = new_b[pos[hit]]
+            chunk_data[nz] = vals
             self.instancesIO.write_data(chunk_data, chunk_slice)
-
         if self.verbose:
-            duration = (datetime.datetime.now() - start_time).total_seconds()
-            print(f"Updated labels in chunk {origin} in {duration:.2f} seconds",
+            d = (datetime.datetime.now() - start_time).total_seconds()
+            print(f"Updated labels in chunk {origin} in {d:.2f} seconds",
                   flush=True)
-
         mark_completed(chunk_coords=np.array([origin, far_corner]),
                        progress_dir=self.progress_dir_pass3)
 
-    def run_relabeling(self, resolved_mapping: dict, n_jobs: int = -1):
+    def run_relabeling(self, old, new, n_jobs: int = -1):
+        from source.utils import filter_remaining_chunks
         print("Pass 3: Applying relabeling...")
-        affected = self.get_affected_chunks(resolved_mapping)
+        chunk_keys, first, ends = self._mapping_blocks(old)
+        affected = self.get_affected_chunks(chunk_keys)
         affected = filter_remaining_chunks(affected, self.progress_dir_pass3)
         if not affected:
             print("All affected chunks already relabeled")
             return
-        Parallel(n_jobs=n_jobs, backend=self.parallel_backend)(
-            delayed(self._apply_relabelling)(origin, far_corner,
-                                             resolved_mapping)
-            for origin, far_corner in tqdm(affected, desc="Updating labels")
-        )
 
-    def compute_merged_metadata(self, resolved_mapping: dict):
-        """Single-process step: fold every merged group's original,
-        per-chunk metadata rows into one row per root object (root =
-        lowest id, matching the union-by-min rule used in Pass 2).
-        Reads only the (typically few) chunk files actually involved in
-        a merge, not the whole dataset."""
+        def _tasks():
+            for origin, far_corner in tqdm(affected, desc="Updating labels"):
+                i = np.searchsorted(chunk_keys, self.id_scheme.chunk_key(origin))
+                sl = slice(first[i], ends[i])
+                yield origin, far_corner, old[sl], new[sl]
+
+        Parallel(n_jobs=n_jobs, backend=self.parallel_backend)(
+            delayed(self._apply_relabelling)(o, f, ob, nb)
+            for o, f, ob, nb in _tasks())
+
+    def compute_merged_metadata(self, old, new, max_workers: int = 16):
         if self.meta_store.merges_computed():
             return
-        if not resolved_mapping:
+        if old.size == 0:
             self.meta_store.write_merges([])
             return
 
-        groups = defaultdict(set)
-        for old_id, root in resolved_mapping.items():
-            groups[root].add(old_id)
-            groups[root].add(root)
+        roots = np.unique(new)
+        ids_all = np.concatenate([old, roots])       # every merged fragment
+        root_all = np.concatenate([new, roots])      # ... and its root
+        order = np.argsort(ids_all)
+        ids_all, root_all = ids_all[order], root_all[order]
 
-        row_cache: dict = {}
+        # only chunks that contain at least one involved object
+        keys = np.unique(self.id_scheme.unpack_chunk_key(ids_all))
+        origins = self.id_scheme.origins_for_keys(keys)
 
-        def _row_for(object_id: int):
-            chunk_id = self._chunk_id_for_object(object_id)
-            if chunk_id not in row_cache:
-                row_cache[chunk_id] = self.meta_store.read_chunk_metadata(
-                    chunk_id)
-            df = row_cache[chunk_id]
-            match = df[df["object_id"] == object_id]
-            return match.iloc[0] if len(match) else None
+        def _load(origin):
+            df = self.meta_store.read_chunk_metadata(self._chunk_id(origin))
+            oid = df["object_id"].to_numpy()
+            pos = np.searchsorted(ids_all, oid)
+            pos[pos == ids_all.size] = 0
+            hit = ids_all[pos] == oid
+            if not hit.any():
+                return None
+            sub = df.loc[hit].drop(columns=["object_id", "chunk_id"])
+            sub["root"] = root_all[pos[hit]]
+            return sub
 
-        merged_rows = []
-        for root, members in groups.items():
-            rows = [r for r in (_row_for(m) for m in members) if r is not None]
-            if not rows:
-                # every member was filtered out upstream by min_object_size
-                continue
-            merged_rows.append({
-                "object_id": int(root),
-                "chunk_id": self._chunk_id_for_object(root),
-                "bbox_z_min": int(min(r["bbox_z_min"] for r in rows)),
-                "bbox_y_min": int(min(r["bbox_y_min"] for r in rows)),
-                "bbox_x_min": int(min(r["bbox_x_min"] for r in rows)),
-                "bbox_z_max": int(max(r["bbox_z_max"] for r in rows)),
-                "bbox_y_max": int(max(r["bbox_y_max"] for r in rows)),
-                "bbox_x_max": int(max(r["bbox_x_max"] for r in rows)),
-                "nvoxels": int(sum(r["nvoxels"] for r in rows)),
-            })
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            parts = [p for p in pool.map(_load, origins) if p is not None]
+        if not parts:            # every member filtered out upstream
+            self.meta_store.write_merges([])
+            return
 
-        self.meta_store.write_merges(merged_rows)
+        out = (pd.concat(parts, ignore_index=True)
+               .groupby("root", sort=True)
+               .agg(bbox_z_min=("bbox_z_min", "min"),
+                    bbox_y_min=("bbox_y_min", "min"),
+                    bbox_x_min=("bbox_x_min", "min"),
+                    bbox_z_max=("bbox_z_max", "max"),
+                    bbox_y_max=("bbox_y_max", "max"),
+                    bbox_x_max=("bbox_x_max", "max"),
+                    nvoxels=("nvoxels", "sum"))
+               .reset_index().rename(columns={"root": "object_id"}))
+        o = self.id_scheme.origins_for_keys(
+            self.id_scheme.unpack_chunk_key(out["object_id"].to_numpy()))
+        out["chunk_id"] = (pd.Series(o[:, 0]).astype(str) + "_"
+                           + pd.Series(o[:, 1]).astype(str) + "_"
+                           + pd.Series(o[:, 2]).astype(str))
+        self.meta_store.write_merges(out)
 
     # ------------------------------------------------------------------
     # promotion + scratch lifecycle
     # ------------------------------------------------------------------
-
     def _promote_consolidated(self):
         """Copy the scratch-internal consolidated file out to the
         permanent, public metadata_path. Cheap and idempotent -- safe
@@ -650,7 +556,6 @@ class InstanceSegmentationPipeline:
     # ------------------------------------------------------------------
     # orchestration
     # ------------------------------------------------------------------
-
     def run_pipeline_parallel(self, n_jobs: int = -1):
         """Run the complete pipeline. Safe to call again after an
         interruption at any point -- every stage checks what's already
@@ -660,24 +565,19 @@ class InstanceSegmentationPipeline:
         etc.) -- that's a separate step over the finalized output of
         this pipeline; see postprocess_instances.py."""
         self.run_instance_pass1(n_jobs)
-        resolved_mapping = self.run_connected_component_analysis(n_jobs)
+        old, new = self.run_connected_component_analysis(n_jobs)
 
-        if resolved_mapping:
-            self.run_relabeling(resolved_mapping, n_jobs)
-        self.compute_merged_metadata(resolved_mapping)
+        if old.size:
+            self.run_relabeling(old, new, n_jobs)
+        self.compute_merged_metadata(old, new)
 
         if not self.meta_store.is_consolidated():
-            self.meta_store.consolidate(get_absorbed_ids(resolved_mapping))
+            self.meta_store.consolidate(np.union1d(old, new))
 
         self._promote_consolidated()
 
-        # Safe to run every time, whether this call just built the
-        # consolidated file or it already existed from a previous run:
-        # cleanup_chunk_files() only ever deletes files once that final
-        # copy of the data is confirmed present, and it's a no-op if
-        # there's nothing left to remove.
-        print(
-            f"DEBUG InstanceSegmentationPipeline.run_pipeline_parallel self.cleanup_chunk_metadata {self.cleanup_chunk_metadata}")
+        # cleanup_chunk_files() only deletes files once that final copy of the
+        # data is confirmed present.
         if self.cleanup_chunk_metadata:
             n_removed = self.meta_store.cleanup_chunk_files()
             if self.verbose and n_removed:
@@ -744,8 +644,8 @@ if __name__ == "__main__":
 
     params = parse_cfg(cfg_params)
 
-    print(f"running instance pipeline with: {cfg_params}")
+    if params.verbose:
+        print(f"__main__: Starting instance segmentation pipeline with following parameters: {cfg_params}")
 
     pipeline = InstanceSegmentationPipeline(params)
-    print(f"DEBUG: DRIVER cleanup is set to {pipeline.cleanup_chunk_metadata}")
     pipeline.run_pipeline_parallel()

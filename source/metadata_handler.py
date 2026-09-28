@@ -1,34 +1,13 @@
-"""
-Per-chunk Parquet metadata storage.
-
-WHY THIS SHAPE
----------------
-The old CSVMetadataManager kept one shared CSV file that every chunk
-appended to (needing a lock) and that got fully read into memory and
-fully rewritten for every merge or column update -- an O(n) operation on
-the whole dataset for what's usually a small change, and a hot spot for
-lock contention under parallel writers.
-
-Here, each chunk writes its own Parquet file during Pass 1
-(`chunk_<chunk_id>.parquet`) -- no shared file, so no lock is needed on
-the write path at all, under threads or separate processes alike. Once
-Pass 3 has resolved every cross-chunk merge, `consolidate()` streams
-every per-chunk file plus the small merge table into ONE final Parquet
-file, written once, atomically. The per-chunk files and the merge table
-are the durable, resumable intermediate state; the consolidated file is
-a derived, write-once artifact -- if it doesn't exist yet, it hasn't
-been built; if it exists, it's complete (never partially written, thanks
-to the temp-file-then-rename pattern used everywhere here).
-"""
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Union
-from concurrent.futures import ThreadPoolExecutor
 
+import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
-from dataclasses import dataclass
 
 
 @dataclass
@@ -54,12 +33,11 @@ def _empty_table() -> pa.Table:
     return pa.Table.from_arrays([pa.array([], type=f.type) for f in _SCHEMA], schema=_SCHEMA)
 
 
-def _rows_to_table(rows: list) -> pa.Table:
-    if not rows:
+def _rows_to_table(rows) -> pa.Table:
+    df = rows if isinstance(rows, pd.DataFrame) else pd.DataFrame(rows)
+    if len(df) == 0:
         return _empty_table()
-    df = pd.DataFrame(rows)[_COLUMNS]
-    return pa.Table.from_pandas(df, schema=_SCHEMA, preserve_index=False)
-
+    return pa.Table.from_pandas(df[_COLUMNS], schema=_SCHEMA, preserve_index=False)
 
 def _atomic_write_table(table: pa.Table, path: Path) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
@@ -77,7 +55,6 @@ class ParquetChunkMetadataStore:
     # ---------------------------------------------------------------
     # Pass 1: one independent write per chunk, no shared state at all
     # ---------------------------------------------------------------
-
     def chunk_file(self, chunk_id: str) -> Path:
         return self.meta_dir / f"chunk_{chunk_id}.parquet"
 
@@ -124,7 +101,6 @@ class ParquetChunkMetadataStore:
     # ---------------------------------------------------------------
     # Final consolidation: write-once, streamed, never partial
     # ---------------------------------------------------------------
-
     def is_consolidated(self) -> bool:
         return self.consolidated_file.exists()
 
@@ -139,7 +115,8 @@ class ParquetChunkMetadataStore:
         tmp = self.consolidated_file.with_suffix(".parquet.tmp")
         writer = pq.ParquetWriter(tmp, _SCHEMA)
         try:
-            absorbed_array = pa.array(sorted(absorbed_ids), type=pa.int64()) if absorbed_ids else None
+            absorbed = np.asarray(absorbed_ids, dtype=np.int64)
+            absorbed_array = pa.array(absorbed) if absorbed.size else None
             for path in sorted(self.meta_dir.glob("chunk_*.parquet")):
                 table = pq.read_table(path)
                 if absorbed_array is not None and table.num_rows:
