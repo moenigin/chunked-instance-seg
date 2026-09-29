@@ -8,7 +8,6 @@ import time
 import yaml
 
 from argparse import ArgumentParser, BooleanOptionalAction
-from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, fields
 from joblib import Parallel, delayed
@@ -39,7 +38,7 @@ class InstanceParams:
     target_label: int = 1
     min_object_size: int = 300
     parallel_backend: str = 'loky'  # 'loky' = multiprocessing-safe (default); 'threading' also supported
-    cleanup_chunk_metadata: bool = True  # delete per-chunk Parquet files once consolidated (see note in run_pipeline_parallel)
+    cleanup_chunk_metadata: bool = True  # delete per-chunk Parquet files once consolidated (see note in run_pipeline)
     verbose: bool = False
     generate_report: bool = True
     report_dir: Optional[
@@ -556,15 +555,11 @@ class InstanceSegmentationPipeline:
     # ------------------------------------------------------------------
     # orchestration
     # ------------------------------------------------------------------
-    def run_pipeline_parallel(self, n_jobs: int = -1):
+    def run_pipeline(self, n_jobs: int = -1):
         """Run the complete pipeline. Safe to call again after an
-        interruption at any point -- every stage checks what's already
-        done before doing it again.
-
-        Does NOT run postprocessing (expand_labels, size filtering,
-        etc.) -- that's a separate step over the finalized output of
-        this pipeline; see postprocess_instances.py."""
+        interruption at any point."""
         self.run_instance_pass1(n_jobs)
+
         old, new = self.run_connected_component_analysis(n_jobs)
 
         if old.size:
@@ -619,8 +614,20 @@ def parse_cfg(cfg_params):
         input_data = Zarr2DataIO(cfg_params['semantic_vol'])
         array_shape = cfg_params.get("volume_size", input_data.shape)
 
+        ZARR_OUTPUT_OPTIONS = {"voxel_size", "add_zarr_metadata",
+                               "write_empty_chunks"}
+
+        zarr_opts = dict(cfg_params.get("zarr_options") or {})
+        unknown = set(zarr_opts) - ZARR_OUTPUT_OPTIONS
+        if unknown:
+            raise ValueError(f"Unknown zarr_options {sorted(unknown)}; "
+                             f"allowed: {sorted(ZARR_OUTPUT_OPTIONS)}")
+        if "voxel_size" in zarr_opts:
+            zarr_opts["voxel_size"] = tuple(
+                zarr_opts["voxel_size"])  # YAML gives a list
+
         output_data = Zarr2DataIO(output_volume, cfg_params['chunk_size'],
-                                  array_shape)
+                                  array_shape, **zarr_opts)
     else:
         raise NotImplementedError(f"{cfg_params['io_func']} is not implemented")
 
@@ -648,4 +655,4 @@ if __name__ == "__main__":
         print(f"__main__: Starting instance segmentation pipeline with following parameters: {cfg_params}")
 
     pipeline = InstanceSegmentationPipeline(params)
-    pipeline.run_pipeline_parallel()
+    pipeline.run_pipeline()

@@ -88,54 +88,51 @@ def generate_chunks(stack_dim: np.ndarray[int], chunk_size: np.ndarray[int]) -> 
     return np.array(list(zip(origins, far_corners)))
 
 
-def open_or_create_zarr_array(output_fn: Union[str, Path],
-                              zarr_chunks: Optional[list[int]] = None,
-                              data_dim: Optional[tuple[int, int, int]] = None,
-                              dtype_: Optional[type] = None,
-                              opening_mode: str = 'a',
-                              voxel_size: Optional[tuple[int, int, int]] = (25, 9, 9)) -> zarr.Array:
-    """
-    :param output_fn:
-    :param zarr_chunks:
-    :param data_dim:
-    :param dtype_: type of the output dataset 'uint8' for images, 'uint64' for segmentations
-    :param voxel_size:
-    :return:
-    """
+def get_or_create_zarr_array(output_fn: Union[str, Path],
+                             zarr_chunks: Optional[list[int]] = None,
+                             data_dim: Optional[tuple[int, int, int]] = None,
+                             dtype_:Optional[type]=None,
+                             opening_mode: Optional[str]='a',
+                             fill_value:Optional[int]=0,
+                             write_empty_chunks:Optional[bool]=False,
+                             add_zarr_metadata:Optional[bool]=True,
+                             voxel_size: Optional[tuple[int, int, int]] = (25, 9, 9))-> zarr.Array:
+    """Return the '0' array at output_fn, creating it if missing."""
+    compressor = Blosc(cname='zstd', clevel=3, shuffle=Blosc.SHUFFLE)
+
     store = parse_url(output_fn, mode=opening_mode).store
     zarr_group = zarr.group(store=store)
     if '0' in zarr_group:
         return zarr_group['0']
 
     assert zarr_chunks is not None and data_dim is not None and dtype_ is not None, \
-        "both zarr_chunks, data_dim and dtype_ need to be given when a new array is created"
+        "zarr_chunks, data_dim and dtype_ must all be given when creating a new array"
 
     output_dataset = zarr_group.create_dataset(
-        name="0",
-        shape=data_dim,
-        chunks=zarr_chunks,
-        dtype=dtype_,
-        cache_attrs=False,
-        compressor=Blosc(cname='zstd', clevel=3, shuffle=Blosc.SHUFFLE),
-        fill_value=0,
-        write_empty_chunks=False,
-        overwrite=False,
+        name="0", shape=data_dim, chunks=zarr_chunks, dtype=dtype_,
+        cache_attrs=False, compressor=compressor, fill_value=fill_value,
+        write_empty_chunks=write_empty_chunks, overwrite=False,
         dimension_separator='/',
     )
-    metadata = {
-        "multiscales": [
-            {"axes": [
-                {"name": "z", "type": "space", "unit": "nanometer"},
-                {"name": "y", "type": "space", "unit": "nanometer"},
-                {"name": "x", "type": "space", "unit": "nanometer"}
-            ],
-                "datasets": [{"coordinateTransformations": [
-                    {"scale": voxel_size, "type": "scale"}],
-                    "path": "0"}], "version": "0.4"}]
-    }
-    zarr_group.attrs.put(metadata)
-    return output_dataset
 
+    if add_zarr_metadata:
+        zarr_group.attrs.put({
+            "multiscales": [{
+                "axes": [
+                    {"name": "z", "type": "space", "unit": "nanometer"},
+                    {"name": "y", "type": "space", "unit": "nanometer"},
+                    {"name": "x", "type": "space", "unit": "nanometer"},
+                ],
+                "datasets": [{
+                    "coordinateTransformations": [
+                        {"scale": voxel_size, "type": "scale"}],
+                    "path": "0",
+                }],
+                "version": "0.4",
+            }]
+        })
+
+    return output_dataset
 
 def _chunk_id(chunk_coords) -> str:
     """Human-readable id for a chunk bbox."""
