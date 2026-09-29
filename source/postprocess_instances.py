@@ -1,3 +1,25 @@
+"""Chained, resumable post-processing over an already-segmented volume
+(the output of instance_segmentation_pipeline.py): label expansion,
+size-based filtering, and a metadata rescan tying them together.
+
+Two kinds of step, because they need different correctness handling:
+- RescanStep: mutates voxels in a way that can change any object's
+  extent unpredictably (e.g. expand_labels can grow an object into a
+  chunk it never touched before). Always writes to a NEW destination,
+  never in place, and the runner triggers a full metadata rescan after
+  one or more of these before the next TargetedStep (or the end).
+- TargetedStep: the voxel changes are already exactly known from the
+  CURRENT metadata (e.g. "zero out object ids X, Y, Z"), so it's safe
+  to mutate in place and update the metadata table directly -- no
+  rescan needed.
+
+Steps are chained by the runner (run_postprocessing), each reading from
+the previous step's output DataIO and (unless allow_overwrite) writing
+to its own private destination, so a later step's halo reads can never
+race an earlier step's in-flight writes to the same store. Progress
+markers and intermediate per-step stores live under scratch_dir and are
+cleaned up on success unless cleanup_scratch=False.
+"""
 import numpy as np
 import pandas as pd
 import shutil
@@ -39,14 +61,17 @@ class OutputVolumeNotWritten(RuntimeError):
 
 
 def get_slice(origin: np.ndarray, far_corner: np.ndarray) -> tuple:
+    """(origin, far_corner) -> a tuple of slices usable on a DataIO."""
     return tuple(slice(int(o), int(f)) for o, f in zip(origin, far_corner))
 
 
 def _new_zarr_like(source_io: DataIO, path: Union[str, Path],
                    chunk_size: np.ndarray) -> Zarr2DataIO:
-    """Create a fresh Zarr array with the same shape/dtype as the
-    source, chunked the same way the pipeline chunks it. RescanSteps
-    write here, never back into the source they're reading from."""
+    """Create a fresh Zarr array with the same shape/dtype as
+    source_io, chunked the same way the pipeline chunks it. Raises if
+    `path` already exists -- RescanSteps write here, never back into
+    the source they're reading from, so an existing path almost always
+    means a stale destination from a previous attempt."""
     path = Path(path)
     if path.exists():
         raise FileExistsError(
@@ -60,13 +85,19 @@ def _new_zarr_like(source_io: DataIO, path: Union[str, Path],
 
 @dataclass
 class PostprocessParams:
+    """Shared context threaded through every step of one postprocessing
+    run. instance_vol/chunk_size/stack_dim describe the volume being
+    processed (instance_vol is reassigned to each step's output as the
+    chain progresses); output_vol_path is the single final destination
+    once every step has run; allow_overwrite mutates the original
+    input in place instead (only valid for a single-step run -- see
+    run_postprocessing)."""
     instance_vol: DataIO
     chunk_size: np.ndarray
     stack_dim: np.ndarray
     scratch_dir: Path
-    output_vol_path: Optional[
-        Path] = None  # single destination for the whole run
-    allow_overwrite: bool = False  # mutate the original input in place
+    output_vol_path: Optional[Path] = None
+    allow_overwrite: bool = False
     parallel_backend: str = 'loky'
     n_jobs: int = -1
     verbose: bool = False
@@ -84,18 +115,18 @@ class RescanStep(ABC):
 
     @abstractmethod
     def apply_to_volume(self, ctx: PostprocessParams) -> DataIO:
-        """Read from ctx.source_io, write the result to a NEW
-        destination (never back into ctx.source_io -- see module
+        """Read from ctx.instance_vol, write the result to a NEW
+        destination (never back into ctx.instance_vol -- see module
         docstring), and return the DataIO for that destination. The
-        runner adopts the return value as the new ctx.source_io for
+        runner adopts the return value as the new ctx.instance_vol for
         any subsequent step."""
 
 
 class TargetedStep(ABC):
     """A step whose voxel changes are already exactly known from the
     CURRENT metadata (e.g. "remove object ids X, Y, Z") -- no
-    volume-wide rescan needed. Safe to mutate ctx.source_io in place,
-    since it never depends on a neighbor's un-mutated state."""
+    volume-wide rescan needed. Safe to mutate ctx.instance_vol in
+    place, since it never depends on a neighbor's un-mutated state."""
 
     name: str = "targeted_step"
     dest_path: Optional[Path] = None
@@ -104,7 +135,7 @@ class TargetedStep(ABC):
     @abstractmethod
     def apply(self, ctx: PostprocessParams,
               metadata_df: pd.DataFrame) -> pd.DataFrame:
-        """Apply the edit to ctx.source_io and return the updated
+        """Apply the edit to ctx.instance_vol and return the updated
         metadata table (e.g. with removed objects' rows dropped)."""
 
 
@@ -112,6 +143,12 @@ class TargetedStep(ABC):
 # RescanStep: expand_labels on haloed, non-overlapping-write chunks
 # ----------------------------------------------------------------------
 class ExpandLabelsStep(RescanStep):
+    """Grow every label outward by `distance` voxels (skimage's
+    expand_labels), processed chunk-by-chunk with a halo so a growth
+    near a chunk boundary is computed correctly. halo must be >=
+    distance for correctness; it defaults to distance, and a little
+    extra margin is cheap insurance, not required."""
+
     name = "expand_labels"
 
     def __init__(self, distance: int, halo: Optional[int] = None,
@@ -119,11 +156,11 @@ class ExpandLabelsStep(RescanStep):
         self.distance = distance
         self.halo = halo if halo is not None else distance
         self.dest_path = Path(dest_path) if dest_path is not None else None
-        # Must be >= distance for correctness (see module docstring);
-        # a little extra margin is cheap insurance, not required.
-        self.halo = halo if halo is not None else distance
 
     def apply_to_volume(self, ctx: PostprocessParams) -> DataIO:
+        """Run expand_labels over every not-yet-completed chunk (each
+        read with a halo from the immutable source) in parallel,
+        writing into a fresh destination array."""
         progress_dir = mk_dir(
             ctx.scratch_dir / f"progress_postprocess_{self.name}")
         project_dir = ctx.scratch_dir.parent
@@ -154,6 +191,8 @@ class ExpandLabelsStep(RescanStep):
 
     def _process_chunk(self, origin, far_corner, ctx: PostprocessParams,
                        dest_io: DataIO, progress_dir: Path):
+        """Expand labels within one haloed read, then write back only
+        the chunk's own (non-halo) core region."""
         halo = np.full(3, self.halo, dtype=np.int64)
         padded_origin = np.maximum(origin - halo, ctx.stack_dim[0])
         padded_far = np.minimum(far_corner + halo, ctx.stack_dim[1])
@@ -196,6 +235,10 @@ def _chunks_overlapping_bbox(bbox, chunk_size: np.ndarray,
 
 
 class SizeFilterStep(TargetedStep):
+    """Zero out every object whose voxel count falls outside
+    [min_nvoxels, max_nvoxels] (either bound may be omitted, not both)
+    and drop its row from the metadata table."""
+
     name = "size_filter"
 
     def __init__(self, dest_path: Optional[Union[str, Path]] = None,
@@ -241,6 +284,11 @@ class SizeFilterStep(TargetedStep):
     @staticmethod
     def _remove_from_volume(ctx: PostprocessParams, rows: pd.DataFrame,
                             dest_path: Path):
+        """Zero every voxel belonging to an object in `rows`, chunk by
+        chunk in parallel. In place (dest_path == the source), only
+        chunks that actually contain a to-be-removed object are
+        touched; writing to a new destination instead copies every
+        chunk across, edited or not."""
         in_place = dest_path == Path(ctx.instance_vol.zarr_path)
 
         if dest_path.exists():
@@ -297,6 +345,10 @@ class SizeFilterStep(TargetedStep):
 # any RescanStep
 # ----------------------------------------------------------------------
 def _rescan_chunk(origin, far_corner, source_io: DataIO) -> pd.DataFrame:
+    """Per-chunk partial bbox/voxel-count summary for every object
+    touching this chunk, via a vectorised groupby (not a per-id
+    np.where loop) -- the building block for rescan_metadata's
+    two-level aggregate."""
     data = source_io.get_data(get_slice(origin, far_corner))
     nz = np.nonzero(data)
     if len(nz[0]) == 0:
@@ -304,10 +356,6 @@ def _rescan_chunk(origin, far_corner, source_io: DataIO) -> pd.DataFrame:
             columns=["object_id", "bbox_z_min", "bbox_y_min", "bbox_x_min",
                      "bbox_z_max", "bbox_y_max", "bbox_x_max", "nvoxels"])
     ids_flat = np.asarray(data[nz]).astype(np.int64)
-    # Vectorized groupby instead of a per-id np.where loop (what Pass 1
-    # itself still does) -- much faster when a chunk holds many objects,
-    # and there's no local-label bookkeeping to preserve here since ids
-    # are already final.
     coords = pd.DataFrame({
         "object_id": ids_flat,
         "z": nz[0] + origin[0], "y": nz[1] + origin[1], "x": nz[2] + origin[2],
@@ -327,10 +375,12 @@ def rescan_metadata(ctx: PostprocessParams) -> pd.DataFrame:
     directly -- the only correct way to know an object's extent after
     an operation (like expand_labels) that can grow it into chunks it
     never originally touched. Two-level aggregate: per-chunk partial
-    bbox/voxel-count contributions computed in parallel (each chunk
-    only holds its own small summary in memory, not every voxel
-    coordinate in the volume at once), then a second, cheap groupby
-    over those small per-chunk summaries."""
+    contributions computed in parallel (each chunk only holds its own
+    small summary in memory, not every voxel coordinate in the volume
+    at once), then a cheap second groupby over those summaries.
+    chunk_id is left unset ("") on the result, since it isn't
+    meaningful for an object now spanning multiple chunks -- the same
+    documented limitation as the main pipeline's merge rows."""
     start = time.time()
     chunks = generate_chunks(ctx.stack_dim, ctx.chunk_size)
     partials = Parallel(n_jobs=ctx.n_jobs, backend=ctx.parallel_backend)(
@@ -351,10 +401,6 @@ def rescan_metadata(ctx: PostprocessParams) -> pd.DataFrame:
             bbox_x_max=("bbox_x_max", "max"),
             nvoxels=("nvoxels", "sum"),
         ).reset_index()
-        # chunk_id isn't meaningful post-rescan for objects spanning
-        # multiple chunks (same documented limitation as the main
-        # pipeline's merge rows) -- leave it unset rather than pick an
-        # arbitrary one that looks more authoritative than it is.
         result["chunk_id"] = ""
     if ctx.verbose:
         print(
@@ -369,6 +415,16 @@ def rescan_metadata(ctx: PostprocessParams) -> pd.DataFrame:
 def run_postprocessing(steps: list, ctx: PostprocessParams,
                        metadata_path: Union[str, Path],
                        output_metadata_path: Optional[str] = None) -> tuple:
+    """Run `steps` in order against `ctx`, starting from the metadata at
+    metadata_path. Rescans metadata before any TargetedStep that
+    follows one or more RescanSteps, and once more at the end if the
+    volume is still "dirty" when the loop finishes. Writes the final
+    metadata to output_metadata_path (or metadata_path if omitted),
+    cleans up scratch on success (unless disabled), and returns
+    (final DataIO, final metadata DataFrame). allow_overwrite is only
+    accepted for a single-step run, since with several chained steps
+    an in-place step's write could race a later step's halo read of
+    the same store."""
     if ctx.allow_overwrite and len(steps) > 1:
         raise ValueError(
             "allow_overwrite=True is only valid for a single-step run -- "
@@ -449,6 +505,10 @@ def _default_step_dest(ctx: PostprocessParams, idx: int,
 
 def _resolve_step_dest(step, ctx: PostprocessParams, idx: int,
                        is_last: bool) -> Path:
+    """Where a step should write: its own explicit dest_path if set,
+    else the original volume in place if ctx.allow_overwrite, else
+    ctx.output_vol_path if it's the last step, else a private scratch
+    path."""
     if step.dest_path is not None:
         return resolve_path(step.dest_path,
                             default_path=ctx.instance_vol.zarr_path,
@@ -461,6 +521,8 @@ def _resolve_step_dest(step, ctx: PostprocessParams, idx: int,
 
 
 def build_steps(step_configs: list) -> list:
+    """Instantiate each step from its config dict via STEP_REGISTRY,
+    keyed by its 'type' field."""
     steps = []
     for cfg in step_configs:
         cfg = dict(cfg)
@@ -476,19 +538,11 @@ def build_steps(step_configs: list) -> list:
 
 def _default_output_vol_path(instance_vol_path: Path, steps: list,
                              project_dir: Path) -> Path:
+    """Default final-output path when none is configured: the input
+    volume's name plus every step's type, so it's traceable from the
+    filename alone."""
     step_names = "_".join(s["type"] for s in steps)
     return project_dir / f"{instance_vol_path.stem}_{step_names}.zarr"
-
-
-def _resolve_step_dest(step, ctx: PostprocessParams, idx: int,
-                       is_last: bool) -> Path:
-    if step.dest_path is not None:
-        return resolve_path(step.dest_path,
-                            default_path=ctx.instance_vol.zarr_path,
-                            base_dir=ctx.scratch_dir.parent)
-    if is_last:
-        return Path(ctx.output_vol_path)
-    return _default_step_dest(ctx, idx, step.name)
 
 
 def cleanup_intermediate(ctx: PostprocessParams, final_vol_path: Path) -> list:
@@ -514,6 +568,10 @@ def cleanup_intermediate(ctx: PostprocessParams, final_vol_path: Path) -> list:
 
 
 def parse_postprocess_cfg(pp_cfg: dict) -> tuple:
+    """Build (PostprocessParams, metadata_path, output_metadata_path,
+    step_configs) from a postprocessing config dict, which must point
+    back at the original pipeline run's config via 'pipeline_config'
+    (that's where the volume, chunk_size, stack_dim etc. come from)."""
     if "pipeline_config" not in pp_cfg:
         raise KeyError(
             "Post-processing config must include 'pipeline_config' pointing to the original run's YAML.")
