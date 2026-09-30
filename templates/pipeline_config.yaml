@@ -12,6 +12,13 @@ semantic_vol: "/path/to/semantic.zarr"  # Input semantic segmentation volume
 instance_vol: "instance_vol.zarr"       # Output instance volume (resolves relative to project_dir)
 metadata_path: "metadata.parquet"       # Consolidated metadata output (resolves relative to project_dir)
 
+# Optional. Only applies the FIRST time instance_vol is created -- ignored
+# on every subsequent (resumed) run, since the array already exists by then.
+zarr_options:
+  voxel_size: [30, 10, 10]           # z, y, x, in nanometers
+  add_zarr_metadata: true            # write OME-NGFF 0.4 multiscales metadata
+  write_empty_chunks: false
+
 # Volume & Chunk Dimensions
 volume_size: [1024, 2048, 2048]         # Total shape of the output array [Z, Y, X]
 chunk_size: [128, 256, 256]             # Processing chunk size [Z, Y, X]
