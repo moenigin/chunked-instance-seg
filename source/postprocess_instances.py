@@ -19,6 +19,10 @@ to its own private destination, so a later step's halo reads can never
 race an earlier step's in-flight writes to the same store. Progress
 markers and intermediate per-step stores live under scratch_dir and are
 cleaned up on success unless cleanup_scratch=False.
+
+Backend-agnostic by construction: this module never names a concrete
+DataIO subclass (e.g. Zarr2DataIO) and never touches a backend-specific
+attribute.
 """
 import numpy as np
 import pandas as pd
@@ -36,7 +40,7 @@ from skimage.segmentation import expand_labels
 from tqdm import tqdm
 from typing import Optional, Union
 
-from source.data_io import DataIO, Zarr2DataIO
+from source.data_io import DataIO
 from source.instance_segmentation_pipeline import parse_cfg
 from source.metadata_handler import \
     _COLUMNS  # same schema/column names as the main pipeline -- single source of truth
@@ -66,12 +70,14 @@ def get_slice(origin: np.ndarray, far_corner: np.ndarray) -> tuple:
 
 
 def _new_zarr_like(source_io: DataIO, path: Union[str, Path],
-                   chunk_size: np.ndarray) -> Zarr2DataIO:
-    """Create a fresh Zarr array with the same shape/dtype as
-    source_io, chunked the same way the pipeline chunks it. Raises if
-    `path` already exists -- RescanSteps write here, never back into
-    the source they're reading from, so an existing path almost always
-    means a stale destination from a previous attempt."""
+                   chunk_size: np.ndarray) -> DataIO:
+    """Create a fresh store of source_io's own backend at `path`, same
+    shape and creation settings, chunked the way the pipeline chunks
+    it -- via source_io.open_or_create_like, never a hardcoded backend
+    class, so this stays correct whatever DataIO subclass is in use.
+    Raises if `path` already exists -- RescanSteps write here, never
+    back into the source they're reading from, so an existing path
+    almost always means a stale destination from a previous attempt."""
     path = Path(path)
     if path.exists():
         raise FileExistsError(
@@ -79,8 +85,8 @@ def _new_zarr_like(source_io: DataIO, path: Union[str, Path],
             f"destination. Delete it first if you intend to redo this step "
             f"from scratch, or point dest_path somewhere new."
         )
-    return Zarr2DataIO(path, chunk_size=tuple(int(c) for c in chunk_size),
-                       array_shape=source_io.shape)
+    return source_io.open_or_create_like(
+        path, chunk_size=tuple(int(c) for c in chunk_size))
 
 
 @dataclass
@@ -169,18 +175,14 @@ class ExpandLabelsStep(RescanStep):
                                       base_dir=ctx.scratch_dir.parent)
 
         if self.dest_path.exists():
-            dest_io = Zarr2DataIO(
-                self.dest_path,
-                chunk_size=tuple(int(c) for c in ctx.chunk_size),
-            )
+            dest_io = ctx.instance_vol.open_or_create_like(
+                self.dest_path, chunk_size=tuple(int(c) for c in ctx.chunk_size))
         else:
             dest_io = _new_zarr_like(ctx.instance_vol, self.dest_path,
                                      ctx.chunk_size)
 
         chunks = generate_chunks(ctx.stack_dim, ctx.chunk_size)
         remaining = filter_remaining_chunks(chunks, progress_dir)
-        print(
-            f"{self.name}: {len(chunks) - len(remaining)}/{len(chunks)} chunks already done")
         if remaining:
             Parallel(n_jobs=ctx.n_jobs, backend=ctx.parallel_backend)(
                 delayed(self._process_chunk)(chunk[0], chunk[1], ctx, dest_io,
@@ -264,7 +266,7 @@ class SizeFilterStep(TargetedStep):
             f"{self.name}: removing {len(to_remove)}/{len(metadata_df)} objects")
 
         dest = Path(self.dest_path)
-        in_place = dest == Path(ctx.instance_vol.zarr_path)
+        in_place = dest == Path(ctx.instance_vol.path)
 
         if len(to_remove) == 0:
             if in_place:
@@ -273,7 +275,7 @@ class SizeFilterStep(TargetedStep):
             else:
                 print(
                     f"{self.name}: nothing to remove -- skipping copy; volume stays at "
-                    f"{ctx.instance_vol.zarr_path} instead of {dest}")
+                    f"{ctx.instance_vol.path} instead of {dest}")
             self.wrote_volume = False
             return metadata_df.loc[keep].reset_index(drop=True)
 
@@ -289,10 +291,10 @@ class SizeFilterStep(TargetedStep):
         chunks that actually contain a to-be-removed object are
         touched; writing to a new destination instead copies every
         chunk across, edited or not."""
-        in_place = dest_path == Path(ctx.instance_vol.zarr_path)
+        in_place = dest_path == Path(ctx.instance_vol.path)
 
         if dest_path.exists():
-            output_volume = Zarr2DataIO(
+            output_volume = ctx.instance_vol.open_or_create_like(
                 dest_path, chunk_size=tuple(int(c) for c in ctx.chunk_size))
         else:
             output_volume = _new_zarr_like(ctx.instance_vol, dest_path,
@@ -314,8 +316,6 @@ class SizeFilterStep(TargetedStep):
             ctx.scratch_dir / f"progress_postprocess_{SizeFilterStep.name}_{dest_path.stem}")
         all_chunks = generate_chunks(ctx.stack_dim, ctx.chunk_size)
         remaining = filter_remaining_chunks(all_chunks, progress_dir)
-        print(
-            f"{SizeFilterStep.name}: {len(all_chunks) - len(remaining)}/{len(all_chunks)} chunks already done")
 
         def _process(origin, far_corner):
             ids = chunk_to_ids.get(tuple(origin.tolist()), [])
@@ -454,9 +454,9 @@ def run_postprocessing(steps: list, ctx: PostprocessParams,
             print(f"--- {step.name} (metadata-targeted) ---")
             metadata_df = step.apply(ctx, metadata_df)
             if step.wrote_volume and Path(step.dest_path) != Path(
-                    ctx.instance_vol.zarr_path):
-                ctx.instance_vol = Zarr2DataIO(Path(step.dest_path),
-                                               chunk_size=ctx.chunk_size)
+                    ctx.instance_vol.path):
+                ctx.instance_vol = ctx.instance_vol.open_or_create_like(
+                    Path(step.dest_path), chunk_size=ctx.chunk_size)
         else:
             raise TypeError(
                 f"step {step!r} is neither a RescanStep nor a TargetedStep")
@@ -470,7 +470,7 @@ def run_postprocessing(steps: list, ctx: PostprocessParams,
     tmp.replace(metadata_path)
 
     output_exists = Path(ctx.output_vol_path) == Path(
-        ctx.instance_vol.zarr_path) or \
+        ctx.instance_vol.path) or \
                     Path(ctx.output_vol_path).exists()
 
     if ctx.cleanup_scratch:
@@ -481,7 +481,7 @@ def run_postprocessing(steps: list, ctx: PostprocessParams,
 
     if not output_exists and ctx.require_output_at_path:
         raise OutputVolumeNotWritten(ctx.output_vol_path,
-                                     ctx.instance_vol.zarr_path)
+                                     ctx.instance_vol.path)
 
     return ctx.instance_vol, metadata_df
 
@@ -499,8 +499,10 @@ def _default_step_dest(ctx: PostprocessParams, idx: int,
                        step_name: str) -> Path:
     """Private scratch destination for one step -- distinct from both
     its own source and any other step's output, so halo reads can
-    never race against in-flight writes."""
-    return ctx.scratch_dir / f"step{idx:02d}_{step_name}.zarr"
+    never race against in-flight writes. No backend-specific suffix
+    (e.g. no hardcoded '.zarr') -- the concrete DataIO backend decides
+    what, if anything, the path needs to look like."""
+    return ctx.scratch_dir / f"step{idx:02d}_{step_name}"
 
 
 def _resolve_step_dest(step, ctx: PostprocessParams, idx: int,
@@ -511,10 +513,10 @@ def _resolve_step_dest(step, ctx: PostprocessParams, idx: int,
     path."""
     if step.dest_path is not None:
         return resolve_path(step.dest_path,
-                            default_path=ctx.instance_vol.zarr_path,
+                            default_path=ctx.instance_vol.path,
                             base_dir=ctx.scratch_dir.parent)
     if ctx.allow_overwrite:
-        return Path(ctx.instance_vol.zarr_path)
+        return Path(ctx.instance_vol.path)
     if is_last and ctx.output_vol_path is not None:
         return Path(ctx.output_vol_path)
     return _default_step_dest(ctx, idx, step.name)
@@ -540,9 +542,11 @@ def _default_output_vol_path(instance_vol_path: Path, steps: list,
                              project_dir: Path) -> Path:
     """Default final-output path when none is configured: the input
     volume's name plus every step's type, so it's traceable from the
-    filename alone."""
+    filename alone. Reuses whatever suffix (or lack of one) the input
+    volume's own path used, rather than assuming '.zarr' -- keeps this
+    correct for a future non-Zarr backend."""
     step_names = "_".join(s["type"] for s in steps)
-    return project_dir / f"{instance_vol_path.stem}_{step_names}.zarr"
+    return project_dir / f"{instance_vol_path.stem}_{step_names}{instance_vol_path.suffix}"
 
 
 def cleanup_intermediate(ctx: PostprocessParams, final_vol_path: Path) -> list:
@@ -555,7 +559,7 @@ def cleanup_intermediate(ctx: PostprocessParams, final_vol_path: Path) -> list:
     are never candidates for removal even if matched by accident."""
     final_vol_path = Path(final_vol_path).resolve()
     removed = []
-    for pattern in ("progress_postprocess_*", "step*.zarr"):
+    for pattern in ("progress_postprocess_*", "step[0-9][0-9]_*"):
         for p in ctx.scratch_dir.glob(pattern):
             if p.resolve() == final_vol_path:
                 continue
@@ -590,7 +594,7 @@ def parse_postprocess_cfg(pp_cfg: dict) -> tuple:
 
     steps = pp_cfg.get("steps", [])
     allow_overwrite = pp_cfg.get("allow_overwrite", False)
-    instance_vol_path = Path(instance_params.output_data.zarr_path)
+    instance_vol_path = Path(instance_params.output_data.path)
 
     out_vol = pp_cfg.get("output_vol_path")
     if out_vol is not None:
@@ -651,4 +655,4 @@ if __name__ == "__main__":
     )
 
     print(f"Postprocessing completed! {len(final_metadata)} objects remain. "
-          f"Final volume: {final_io.zarr_path if hasattr(final_io, 'zarr_path') else final_io}")
+          f"Final volume: {final_io.path}")
